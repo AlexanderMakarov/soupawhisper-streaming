@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from faster_whisper.transcribe import Segment
+from faster_whisper.transcribe import Segment, Word
 
 import numpy as np
 
@@ -93,13 +93,6 @@ class Typer:
             return
         if self.start_delay_ms > 0:
             time.sleep(self.start_delay_ms / 1000.0)
-        # Clear any modifier keys that might be stuck from hotkey press
-        # subprocess.run(
-        #     ["xdotool", "keyup", "ctrl", "alt", "shift", "super"],
-        #     stdout=subprocess.DEVNULL,
-        #     stderr=subprocess.DEVNULL,
-        #     timeout=2
-        # )
         # Remove previous characters if needed.
         if previous_length > 0:
             subprocess.run(
@@ -230,12 +223,9 @@ class Dictation:
             "-c", "1",       # Mono
             "-t", "wav",
         ]
-        
         if duration is not None:
             cmd.extend(["-d", str(int(duration))])
-        
         cmd.append(output_file)
-        
         return subprocess.Popen(
             cmd,
             stdout=stdout,
@@ -377,7 +367,7 @@ class StreamingDictation(Dictation):
         # Streaming state
         self.active_recordings: dict[int, tuple[str, subprocess.Popen, float]] = {}  # chunk_index -> (file_path, process, start_time)
         self.record_thread: Optional[threading.Thread] = None
-        self.accumulated_segments: list[Segment] = []
+        self.accumulated_words: list[Word] = []
 
         # Create typer once in constructor
         self.typer: Optional[Typer] = None
@@ -416,7 +406,7 @@ class StreamingDictation(Dictation):
         # Reset transcription state.
         self.recording = True
         self.active_recordings = {}
-        self.accumulated_segments = []
+        self.accumulated_words = []
 
         # Clear queues to remove any leftover sentinels from previous recording
         while not self.transcription_queue.empty():
@@ -465,7 +455,7 @@ class StreamingDictation(Dictation):
         logger.info(f"[record] Chunk {chunk_idx} started recording to {chunk_file.name}")
         # Wait for recording to finish
         chunk_process.wait()
-        logger.info(f"[record] Chunk {chunk_idx} recording finished")
+        logger.debug(f"[record] Chunk {chunk_idx} recording finished")
         # Remove from active recordings
         if chunk_idx in self.active_recordings:
             del self.active_recordings[chunk_idx]
@@ -489,7 +479,7 @@ class StreamingDictation(Dictation):
                 def on_recording_done(fut):
                     try:
                         file_path, start_time, chunk_idx = fut.result()
-                        self.transcription_queue.put((file_path, start_time, chunk_idx))
+                        self.transcription_queue.put((file_path, start_time, chunk_idx, self.streaming_chunk_seconds))
                     except Exception as e:
                         logger.error(f"[record] Error in recording chunk {chunk_idx}: {e}", exc_info=True)
 
@@ -513,38 +503,42 @@ class StreamingDictation(Dictation):
                 chunk_data = self.transcription_queue.get(timeout=0.1)
                 if chunk_data is None:
                     break
-                chunk_file_path, chunk_absolute_start_time, chunk_idx = chunk_data
+                chunk_file_path, chunk_absolute_start_time, chunk_idx, chunk_duration = chunk_data
                 # Transcribe chunk
                 trans_start = time.time()
-                new_segments = self._transcribe_chunk(chunk_file_path, chunk_absolute_start_time)
+                new_segments, speech_duration = self._transcribe_chunk(chunk_file_path, chunk_idx, chunk_absolute_start_time)
                 trans_duration = time.time() - trans_start
                 # Remove temp file
                 try:
-                    logger.info(f"[transcriber] Chunk {chunk_idx} file {chunk_file_path} deleted")
+                    logger.debug(f"[transcriber] Chunk {chunk_idx} file {chunk_file_path} deleted")
                     os.unlink(chunk_file_path)
                 except Exception as e:
                     logger.warning(f"[transcriber] Chunk {chunk_idx} file {chunk_file_path} failed to delete: {e}")
 
-                # Check if transcription took too long
-                if trans_duration >= self.streaming_overlap_seconds:
-                    logger.warning(f"[transcriber] Chunk {chunk_idx} transcription took {trans_duration:.2f}s (>= {self.streaming_overlap_seconds}s) - transcription is lagging")
-                    if self.config["notifications"]:
-                        self.notify("Transcription too slow", f"Chunk {chunk_idx} took {trans_duration:.2f}s. Transcription is lagging.", "dialog-warning", 3000)
-
                 # Check if there are any segments transcribed.
                 if not new_segments:
-                    logger.info(f"[transcriber] Chunk {chunk_idx} no words transcribed")
+                    logger.info(f"[transcriber] Chunk {chunk_idx} no speech found (transcribed in {trans_duration:.2f}s)")
                     continue
 
-                # If there are new segments then process them.
-                chars_to_remove = 0
+                # Check if transcription took too long.
+                log_prefix = f"[transcriber] Chunk {chunk_idx} transcription took {trans_duration:.2f}s (for {speech_duration:.2f}s of speech)"
+                if trans_duration >= self.streaming_overlap_seconds:
+                    speed_ratio = trans_duration / chunk_duration
+                    logger.warning(f"{log_prefix} ({speed_ratio:.2f}x) which is >= {self.streaming_overlap_seconds}s) - transcription is lagging")
+                    if self.config["notifications"]:
+                        self.notify("Transcription is lagging", f"Transcribing speed is{speed_ratio:.2f}x while for real-time need at least 2.0x. Transcription is lagging.", "dialog-warning", 3000)
+                else:
+                    logger.info(log_prefix)
+
+                # Process new segments.
+                text_to_remove = ""
                 text_to_type = ""
                 if chunk_idx == 1:
                     # First chunk - just print transcription as is
                     text_to_type = self._segments_to_text(new_segments, False)
-                    self.accumulated_segments = new_segments
+                    self.accumulated_words = [w for s in new_segments for w in getattr(s, "words", [])]
                 else:
-                    # Not first chunk - process with overlap handling
+                    # Not first chunk - process with overlap handling.
                     text_to_remove, text_to_type = self._process_words_with_overlap(new_segments, chunk_absolute_start_time, chunk_idx)
                 if self.typing_queue and text_to_type:
                     self.typing_queue.put((text_to_remove, text_to_type, chunk_idx))
@@ -582,22 +576,25 @@ class StreamingDictation(Dictation):
             except Exception as e:
                 logger.error(f"[typer] {e}", exc_info=True)
 
-    def _transcribe_chunk(self, chunk_file_path: str, chunk_absolute_start_time: float) -> list[Segment]:
+    def _transcribe_chunk(self, chunk_file_path: str, chunk_idx: int, chunk_absolute_start_time: float) -> tuple[list[Segment], float]:
         """
         Transcribe a single audio chunk file using faster-whisper with word timestamps.
-        Returns list of Segment objects with absolute timestamps.
+        Returns list of `Segment` objects with absolute timestamps and speech duration.
         """
         try:
             if self.model is None:
                 logger.error("[transcriber] Model not loaded")
-                return []
+                return [], 0.0
             # Pass file path to faster-whisper for transcription
             segments, info = self.model.transcribe(
                 chunk_file_path,
                 beam_size=5,
                 vad_filter=True,
                 word_timestamps=True,
+                temperature=0.0,  # Fixed temperature to avoid fallback attempts.
+                log_prob_threshold=None,  # No threshold to reduce retries.
             )
+            absolute_segments = []
             for segment in segments:
                 # Convert relative timestamps to absolute by adding chunk start time
                 segment.start += chunk_absolute_start_time
@@ -607,20 +604,29 @@ class StreamingDictation(Dictation):
                     for word in segment.words:
                         word.start += chunk_absolute_start_time
                         word.end += chunk_absolute_start_time
-            return list(segments)
+                absolute_segments.append(segment)
+            return absolute_segments, info.duration_after_vad
         except Exception as e:
-            logger.error(f"[transcriber] Failed to transcribe chunk: {e}", exc_info=True)
-            return []
+            logger.error(f"[transcriber] Chunk {chunk_idx} failed to transcribe: {e}", exc_info=True)
+            return [], 0.0  
+
+    def _words_to_text(self, words: Iterable[Word]) -> str:
+        return " ".join(word.word.strip() for word in words)
 
     def _process_words_with_overlap(self, new_segments: list[Segment], chunk_absolute_start_time: float, chunk_idx: int) -> tuple[str, str]:
         """
-        Process new words with overlap handling according to strategy:
+        Process new segments with overlap handling.
 
+        Note that `Segment` is a unit of transcription - how model transcribed pieces of audio.
+        `Segment` consists of `Word`-s and can't be compared with previous words.
+        `Word` is a unit of text for comparison with previous words.
+
+        Strategy:
         - Calculate overlap region. Words after it would be printed as is.
         - Match words between previous chunk and current chunk by timestamps with threshold.
         - If first word of current chunk is timestamped within threshold of chunk start then it should be skipped from matching.
         - Other words from current chunk have priority over words from previous chunk.
-        - On the first difference found: update accumulated text with removing old words from the difference and typing rest of the new words. Send similar task to typing worker.
+        - On the first difference found: update accumulated words with removing old words from the difference and typing rest of new words. Send similar task to typing worker.
         - If no difference found: just print words from not overlapped interval of current chunk.
 
         Args:
@@ -633,86 +639,120 @@ class StreamingDictation(Dictation):
         if not new_segments:
             return "", ""
 
-        # If no accumulated segments, just add all new segments and return
-        if not self.accumulated_segments:
+        # If no accumulated segments, just add all new words and return.
+        if not self.accumulated_words:
             text_to_type = self._segments_to_text(new_segments, False)
-            self.accumulated_segments.extend(new_segments)
+            self.accumulated_words = [w for s in new_segments for w in getattr(s, "words", [])]
             return "", text_to_type
 
         # Calculate overlap end to find non-overlapped segments.
-        chunk_start = chunk_absolute_start_time
         threshold = self.streaming_match_words_threshold_seconds
 
-        # Find first overlapping segment and last overlapping word end time
-        first_overlapping_seg_idx = len(self.accumulated_segments) - 1
+        # Find first overlapping word and last overlapping word end time.
+        # A word overlaps if it starts before or at chunk start and ends after chunk start,
+        # OR if it starts after chunk start.
+        first_overlapping_word_idx = len(self.accumulated_words) - 1
         last_overlapping_word_end = None
-        for seg_idx, segment in enumerate(self.accumulated_segments):
-            if segment.start > chunk_start:
-                first_overlapping_seg_idx = seg_idx
+        for word_idx, word in enumerate(self.accumulated_words):
+            # Word overlaps if: (starts before/at chunk and ends after chunk) OR (starts after chunk)
+            if (word.start <= chunk_absolute_start_time < word.end) or (word.start > chunk_absolute_start_time):
+                first_overlapping_word_idx = word_idx
                 break
-        last_overlapping_word_end = self.accumulated_segments[-1].end
+        last_overlapping_word_end = self.accumulated_words[-1].end
 
         # Log overlap to process.
-        overlapping_words_text = self._segments_to_text(self.accumulated_segments[first_overlapping_seg_idx:], False)
-        new_words_text = self._segments_to_text(new_segments, False)
-        logger.info(f"[transcriber] Chunk {chunk_idx} over overlapped '{overlapping_words_text}' processing words: {new_words_text}")
+        overlapping_text = self._words_to_text(self.accumulated_words[first_overlapping_word_idx:])
+        new_text = self._segments_to_text(new_segments, False)
+        logger.info(f"[transcriber] Chunk {chunk_idx} matching overlapped '{overlapping_text}' with new words: {new_text}")
 
-        # Check if first segment is near chunk start
-        first_segment_start = new_segments[0].start
-        first_segment_near_start = (first_segment_start - chunk_start) <= threshold
+        # New words always have high priority except the first one if it's near start.
+        # Convert new segments to priority words.
+        priority_words: list[Word] = [w for s in new_segments for w in getattr(s, "words", [])]
 
-        # New words always have high priority.
-        priority_segments = new_segments
-        # Cut out first segment if it's near start (it has lower priority).
-        if first_segment_near_start:
-            priority_segments = new_segments[1:]
+        # Check if first word is near chunk start and cut it out if it is.
+        first_word_start = priority_words[0].start
+        if (first_word_start - chunk_absolute_start_time) <= threshold:
+            priority_words = priority_words[1:]
+            logger.debug(f"[transcriber] Chunk {chunk_idx} first word is near start, cutting it out and using words: {self._words_to_text(priority_words)}")
 
-        # Loop over higher_priority_segments forward, search backwards in accumulated_segments
-        last_matched_accumulated_idx = len(self.accumulated_segments) - 1
-        first_mismatch_idx = None  # Index in priority_segments.
-        for i, segment in enumerate(priority_segments):
-            # Check if current segment is after last overlapping segment.
-            if segment.end > last_overlapping_word_end:
+        # Loop over priority_words forward, search backwards in accumulated_words.
+        # Start searching from the end of accumulated_words and work backwards.
+        last_matched_accumulated_idx = len(self.accumulated_words)
+        first_mismatch_idx = None  # Index in priority_words.
+        last_processed_priority_idx = -1  # Track last processed priority word index.
+        for i, word in enumerate(priority_words):
+            # Check if current word is after last overlapping word.
+            if word.end > last_overlapping_word_end:
+                # This word is after overlap, so last processed is i-1, and we should add from i.
+                last_processed_priority_idx = i - 1
                 break
-            # Reset last matched accumulated index to the end of accumulated segments.
-            last_matched_accumulated_idx = len(self.accumulated_segments) - 1
-            # Search backwards in accumulated_segments.
-            # I.e. from end to first_overlapping_seg_idx.
-            inner_idx = len(self.accumulated_segments) - 1
-            for j in range(len(self.accumulated_segments) - 1, last_matched_accumulated_idx, -1):
-                accumulated_segment = self.accumulated_segments[j]
+            # Search backwards in accumulated_words from the end down to first_overlapping_word_idx.
+            # Always search from the end to find the best match (words later in time are more likely to match).
+            word_matched = False
+            matched_accumulated_idx = None
+            # Search from end backwards to first_overlapping_word_idx
+            for j in range(len(self.accumulated_words) - 1, first_overlapping_word_idx - 1, -1):
+                accumulated_word = self.accumulated_words[j]
                 # Check if timestamps match within threshold.
-                if abs(segment.start - accumulated_segment.start) <= threshold or abs(segment.end - accumulated_segment.end) <= threshold:
-                    # Timestamps match - check if text is different (mismatch).
-                    if segment.text != accumulated_segment.text:
-                        last_matched_accumulated_idx = inner_idx
-                        first_mismatch_idx = i
-                        break
-                    # Timestamps match and text is same - continue matching.
-                    inner_idx = j
-            # Check first mismatch is found.
-            if first_mismatch_idx is None:
+                start_diff = abs(word.start - accumulated_word.start)
+                end_diff = abs(word.end - accumulated_word.end)
+                if start_diff <= threshold or end_diff <= threshold:
+                    # Timestamps match - check if text matches.
+                    if word.word.strip() == accumulated_word.word.strip():
+                        # Text matches - this word is correctly matched.
+                        word_matched = True
+                        matched_accumulated_idx = j
+                        logger.debug(f"[transcriber] Chunk {chunk_idx} word '{word.word}' matched '{accumulated_word.word}' at idx {j}")
+                    else:
+                        # Text doesn't match - this is a mismatch.
+                        matched_accumulated_idx = j
+                        logger.debug(f"[transcriber] Chunk {chunk_idx} word '{word.word}' mismatched '{accumulated_word.word}' at idx {j} (start_diff={start_diff:.3f}, end_diff={end_diff:.3f})")
+                    break
+            # Update last_matched_accumulated_idx if we found a match.
+            if word_matched and matched_accumulated_idx is not None:
+                last_matched_accumulated_idx = matched_accumulated_idx
+                last_processed_priority_idx = i
+            elif matched_accumulated_idx is not None:
+                # Mismatch found - text doesn't match at this timestamp.
                 first_mismatch_idx = i
+                last_matched_accumulated_idx = matched_accumulated_idx
                 break
+            else:
+                # No timestamp match found - this word is new.
+                last_processed_priority_idx = i
 
         # Check if mismatch found.
         if first_mismatch_idx is not None:
             # Calculate segments to remove.
-            segments_to_remove = self.accumulated_segments[:last_matched_accumulated_idx]
-            segments_to_add = priority_segments[first_mismatch_idx:]
+            words_to_remove = self.accumulated_words[last_matched_accumulated_idx:]
+            words_to_add = priority_words[first_mismatch_idx:]
 
-            # Replace tail of accumulated_segments with higher priority segments
-            self.accumulated_segments = self.accumulated_segments[:last_matched_accumulated_idx + 1] + segments_to_add
+            # Replace tail of accumulated_words with higher priority words
+            self.accumulated_words = self.accumulated_words[:last_matched_accumulated_idx] + words_to_add
 
             # Calculate chars to remove and text to type
-            old_text_to_remove = self._segments_to_text(segments_to_remove, False)
-            new_text_to_type = self._segments_to_text(segments_to_add, False)
+            old_text_to_remove = self._words_to_text(words_to_remove)
+            new_text_to_type = self._words_to_text(words_to_add)
             logger.info(f"[transcriber] Chunk {chunk_idx} mismatch found, removing '{old_text_to_remove}' and typing: {new_text_to_type}")
             return old_text_to_remove, new_text_to_type
         else:
-            # No mismatches found - append remaining unmatched segments from priority_segments.
-            segments_to_add = priority_segments[last_matched_accumulated_idx:]
-            new_text_to_type = self._segments_to_text(segments_to_add, False)
+            # No mismatches found - find words from priority_words that are after the overlap region.
+            words_to_add = []
+            # Find first word after overlap (if we broke from loop, last_processed_priority_idx + 1 is correct).
+            # If we completed loop, find first word with end > last_overlapping_word_end.
+            start_idx = last_processed_priority_idx + 1
+            if start_idx >= len(priority_words):
+                # We processed all words, find any that are after overlap.
+                for idx, word in enumerate(priority_words):
+                    if word.end > last_overlapping_word_end:
+                        start_idx = idx
+                        break
+            if start_idx < len(priority_words):
+                words_to_add = priority_words[start_idx:]
+            new_text_to_type = self._words_to_text(words_to_add)
+            if words_to_add:
+                # Update accumulated_words with new words.
+                self.accumulated_words.extend(words_to_add)
             logger.info(f"[transcriber] Chunk {chunk_idx} typing: {new_text_to_type}")
             return "", new_text_to_type
 
@@ -724,7 +764,7 @@ class StreamingDictation(Dictation):
         while (not self.transcription_queue.empty() or not self.typing_queue.empty()) and wait_time < max_wait_time:
             time.sleep(0.1)
             wait_time += 0.1
-        return self._segments_to_text(self.accumulated_segments, False)
+        return self._words_to_text(self.accumulated_words)
 
     def stop_recording(self):
         if not self.recording:
@@ -735,7 +775,7 @@ class StreamingDictation(Dictation):
             if process.poll() is None:
                 process.wait()
             if os.path.exists(file_path):
-                self.transcription_queue.put((file_path, start_time, chunk_idx))
+                self.transcription_queue.put((file_path, start_time, chunk_idx, self.streaming_chunk_seconds))
         self.active_recordings.clear()
         # Signal workers to stop
         self.transcription_queue.put(None)

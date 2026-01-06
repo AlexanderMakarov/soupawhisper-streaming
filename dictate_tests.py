@@ -32,21 +32,8 @@ sys.modules['pynput.keyboard'] = MagicMock()
 # Now import dictate
 import dictate
 
-
-class MockWhisperSegment:
-    """Mock Whisper segment with words."""
-    def __init__(self, text, words):
-        self.text = text
-        self.words = words
-
-
-class MockWhisperWord:
-    """Mock Whisper word with timestamps."""
-    def __init__(self, word, start, end, probability=0.9):
-        self.word = word
-        self.start = start
-        self.end = end
-        self.probability = probability
+# Import real Segment and Word from faster_whisper
+from faster_whisper.transcribe import Segment, Word
 
 
 class MockWhisperModel:
@@ -62,18 +49,26 @@ class MockWhisperModel:
         """Mock transcribe that records calls and returns test data."""
         self.transcribe_calls.append((audio_path, kwargs))
         
-        # Return mock segments based on audio path or kwargs
+        # Return real segments based on audio path or kwargs
         if "word_timestamps" in kwargs and kwargs["word_timestamps"]:
             # Return segments with word timestamps for streaming tests
             words = [
-                MockWhisperWord("hello", 0.0, 0.5),
-                MockWhisperWord("world", 0.6, 1.0),
+                Word(word="hello", start=0.0, end=0.5, probability=0.9),
+                Word(word="world", start=0.6, end=1.0, probability=0.9),
             ]
-            segment = MockWhisperSegment("hello world", words)
+            segment = Segment(
+                id=0, seek=0, start=0.0, end=1.0, text="hello world",
+                tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+                no_speech_prob=0.0, words=words, temperature=None
+            )
             return [segment], {"language": "en"}
         else:
             # Return simple segments for non-streaming tests
-            segment = MockWhisperSegment("test transcription", [])
+            segment = Segment(
+                id=0, seek=0, start=0.0, end=1.0, text="test transcription",
+                tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+                no_speech_prob=0.0, words=None, temperature=None
+            )
             return [segment], {"language": "en"}
 
 
@@ -342,7 +337,7 @@ class TestStreamingDictation:
         # Update config for streaming
         config = dictate.load_config()
         config["default_streaming"] = True
-        config["auto_type"] = False  # Disable typing to avoid extra threads
+        config["auto_type"] = True  # Required for streaming mode
         
         dictation = dictate.StreamingDictation(config)
         dictation.model_loaded.wait(timeout=1.0)
@@ -541,7 +536,11 @@ class TestClipboardIntegration:
         dictation.recording = True
         
         # Mock model return
-        segment = MockWhisperSegment("test text", [])
+        segment = Segment(
+            id=0, seek=0, start=0.0, end=1.0, text="test text",
+            tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+            no_speech_prob=0.0, words=None, temperature=None
+        )
         dictation.model.transcribe.side_effect = None
         dictation.model.transcribe.return_value = ([segment], {})
         
@@ -641,28 +640,33 @@ class TestWordDeduplication:
         dictation = dictate.StreamingDictation(config)
         dictation.model_loaded.wait(timeout=1.0)
         
-        # Test the _process_words_with_overlap method directly
-        # First chunk words (chunk starts at 0.0, ends at 3.0)
-        words1 = [
-            (0.0, 0.5, "hello"),
-            (0.6, 1.0, "world"),
+        # First chunk words (absolute timestamps)
+        dictation.accumulated_words = [
+            Word(word="hello", start=0.0, end=0.5, probability=0.9),
+            Word(word="world", start=0.6, end=1.0, probability=0.9),
         ]
-        dictation.previous_chunk_words = words1
-        dictation.accumulated_text = "hello world"
         
-        # Second chunk with exact overlap (chunk starts at 1.5, ends at 4.5, overlaps from 1.5 to 3.0)
+        # Second chunk with exact overlap (chunk starts at 1.5)
         # The word "world" at 1.5-2.0 is in overlap region and should match previous "world" at 0.6-1.0
-        # Word "test" at 3.1-3.5 is after overlap_end (3.0), so it's in non-overlapped region
-        words2 = [
-            (1.5, 2.0, "world"),  # In overlap region, should match previous "world" 
-            (3.1, 3.5, "test"),   # After overlap region (3.1 >= 3.0)
+        # Word "test" at 3.1-3.5 is after overlap_end, so it's in non-overlapped region
+        chunk2_start = 1.5
+        new_words = [
+            Word(word="world", start=chunk2_start + 0.0, end=chunk2_start + 0.5, probability=0.9),  # 1.5-2.0, should match previous "world" at 0.6-1.0
+            Word(word="test", start=chunk2_start + 1.6, end=chunk2_start + 2.0, probability=0.9),  # 3.1-3.5, after overlap
         ]
-        # chunk_absolute_start_time should be 1.5 (start of second chunk)
-        # chunk_idx should be 2 (second chunk)
-        dictation._process_words_with_overlap(words2, 1.5, 2)
+        new_segments = [Segment(
+            id=0, seek=0, start=chunk2_start, end=chunk2_start + 2.0, text="world test",
+            tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+            no_speech_prob=0.0, words=new_words, temperature=None
+        )]
+        
+        text_to_remove, text_to_type = dictation._process_words_with_overlap(new_segments, chunk2_start, 2)
         
         # Should only add "test", not duplicate "world"
-        assert "test" in dictation.accumulated_text
+        accumulated_text = " ".join(w.word for w in dictation.accumulated_words)
+        assert "test" in accumulated_text
+        # "world" should only appear once (from the original)
+        assert accumulated_text.count("world") == 1
     
     def test_partial_overlap_deduplication(self, mock_config, mock_whisper_model):
         """Test that partially overlapping words are handled correctly."""
@@ -670,23 +674,29 @@ class TestWordDeduplication:
         dictation = dictate.StreamingDictation(config)
         dictation.model_loaded.wait(timeout=1.0)
         
-        # First chunk words
-        words1 = [
-            (0.0, 0.5, "hello"),
-            (0.6, 1.0, "world"),
+        # First chunk words (absolute timestamps)
+        dictation.accumulated_words = [
+            Word(word="hello", start=0.0, end=0.5, probability=0.9),
+            Word(word="world", start=0.6, end=1.0, probability=0.9),
         ]
-        dictation.previous_chunk_words = words1
-        dictation.accumulated_text = "hello world"
         
         # Second chunk with partial overlap
-        words2 = [
-            (0.8, 1.2, "world"),  # Partial overlap
-            (1.3, 1.7, "test"),
+        chunk2_start = 0.8
+        new_words = [
+            Word(word="world", start=chunk2_start + 0.0, end=chunk2_start + 0.4, probability=0.9),  # 0.8-1.2, partial overlap with previous "world" at 0.6-1.0
+            Word(word="test", start=chunk2_start + 0.5, end=chunk2_start + 0.9, probability=0.9),  # 1.3-1.7
         ]
-        dictation._process_words_with_overlap(words2, 0.8, 2)
+        new_segments = [Segment(
+            id=0, seek=0, start=chunk2_start, end=chunk2_start + 0.9, text="world test",
+            tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+            no_speech_prob=0.0, words=new_words, temperature=None
+        )]
+        
+        text_to_remove, text_to_type = dictation._process_words_with_overlap(new_segments, chunk2_start, 2)
         
         # Should handle overlap correctly
-        assert "test" in dictation.accumulated_text
+        accumulated_text = " ".join(w.word for w in dictation.accumulated_words)
+        assert "test" in accumulated_text
     
     def test_no_overlap_new_words(self, mock_config, mock_whisper_model):
         """Test that non-overlapping words are both added."""
@@ -694,25 +704,94 @@ class TestWordDeduplication:
         dictation = dictate.StreamingDictation(config)
         dictation.model_loaded.wait(timeout=1.0)
         
-        # First chunk words (chunk starts at 0.0, ends at 3.0)
-        words1 = [
-            (0.0, 0.5, "hello"),
+        # First chunk words (absolute timestamps)
+        dictation.accumulated_words = [
+            Word(word="hello", start=0.0, end=0.5, probability=0.9),
         ]
-        dictation.previous_chunk_words = words1
-        dictation.accumulated_text = "hello"
         
-        # Second chunk with no overlap (chunk starts at 1.5, overlap region is 1.5 to 3.0)
-        # Word "world" at 5.0-5.5 is after overlap_end (3.0), so it's in non-overlapped region
-        words2 = [
-            (5.0, 5.5, "world"),  # After overlap region (starts at 5.0, overlap_end is 3.0)
+        # Second chunk with no overlap (chunk starts at 1.5)
+        # Word "world" at 5.0-5.5 is after overlap_end, so it's in non-overlapped region
+        chunk2_start = 1.5
+        new_words = [
+            Word(word="world", start=5.0, end=5.5, probability=0.9),  # After overlap region
         ]
-        # chunk_absolute_start_time should be 1.5 (start of second chunk)
-        # chunk_idx should be 2 (second chunk)
-        dictation._process_words_with_overlap(words2, 1.5, 2)
+        new_segments = [Segment(
+            id=0, seek=0, start=5.0, end=5.5, text="world",
+            tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+            no_speech_prob=0.0, words=new_words, temperature=None
+        )]
+        
+        text_to_remove, text_to_type = dictation._process_words_with_overlap(new_segments, chunk2_start, 2)
         
         # Both words should be present
-        assert "hello" in dictation.accumulated_text
-        assert "world" in dictation.accumulated_text
+        accumulated_text = " ".join(w.word for w in dictation.accumulated_words)
+        assert "hello" in accumulated_text
+        assert "world" in accumulated_text
+    
+    def test_word_replacement_on_mismatch(self, mock_config, mock_whisper_model):
+        """Test that mismatched words at similar timestamps are correctly replaced.
+        
+        This tests the specific bug where "shop." was not replaced with "so we".
+        Scenario: Chunk 1 has "full fine shop." and Chunk 2 has "and full fine so we should find three seats in the way."
+        After cutting "and" (near start), "shop." should be replaced with "so we should find three seats in the way."
+        """
+        config = dictate.load_config()
+        config["streaming_match_words_threshold_seconds"] = 0.1
+        dictation = dictate.StreamingDictation(config)
+        dictation.model_loaded.wait(timeout=1.0)
+        
+        # Chunk 1: "full fine shop." (absolute timestamps)
+        # Chunk 1 started at 0.0
+        dictation.accumulated_words = [
+            Word(word="full", start=0.0, end=0.3, probability=0.9),
+            Word(word="fine", start=0.4, end=0.7, probability=0.9),
+            Word(word="shop.", start=0.8, end=1.1, probability=0.9),
+        ]
+        
+        # Chunk 2: "and full fine so we should find three seats in the way."
+        # Chunk 2 starts at 0.0 (same start for simplicity, but we'll use overlap logic)
+        # Actually, let's use 0.5 to have real overlap
+        chunk2_start = 0.0
+        
+        # Create new segments for chunk 2 with absolute timestamps
+        # "and" is at chunk start (should be cut out), "full" and "fine" match, "so" replaces "shop."
+        # Key: "so" at 0.9-1.1 should match timestamp with "shop." at 0.8-1.1 (within 0.1 threshold)
+        # Make sure "full" and "fine" have matching timestamps first
+        threshold = config["streaming_match_words_threshold_seconds"]
+        new_words = [
+            Word(word="and", start=chunk2_start + 0.0, end=chunk2_start + 0.05, probability=0.9),  # 0.0-0.05, will be cut (near start, within threshold)
+            Word(word="full", start=chunk2_start + 0.0, end=chunk2_start + 0.3, probability=0.9),  # 0.0-0.3, matches "full" at 0.0-0.3
+            Word(word="fine", start=chunk2_start + 0.4, end=chunk2_start + 0.7, probability=0.9),  # 0.4-0.7, matches "fine" at 0.4-0.7
+            Word(word="so", start=chunk2_start + 0.8, end=chunk2_start + 1.1, probability=0.9),  # 0.8-1.1, matches "shop." at 0.8-1.1 but different text!
+            Word(word="we", start=chunk2_start + 1.2, end=chunk2_start + 1.4, probability=0.9),  # 1.2-1.4
+            Word(word="should", start=chunk2_start + 1.5, end=chunk2_start + 1.8, probability=0.9),  # 1.5-1.8
+            Word(word="find", start=chunk2_start + 1.9, end=chunk2_start + 2.2, probability=0.9),  # 1.9-2.2
+            Word(word="three", start=chunk2_start + 2.3, end=chunk2_start + 2.6, probability=0.9),  # 2.3-2.6
+            Word(word="seats", start=chunk2_start + 2.7, end=chunk2_start + 3.0, probability=0.9),  # 2.7-3.0
+            Word(word="in", start=chunk2_start + 3.1, end=chunk2_start + 3.3, probability=0.9),  # 3.1-3.3
+            Word(word="the", start=chunk2_start + 3.4, end=chunk2_start + 3.6, probability=0.9),  # 3.4-3.6
+            Word(word="way.", start=chunk2_start + 3.7, end=chunk2_start + 4.0, probability=0.9),  # 3.7-4.0
+        ]
+        new_segments = [Segment(
+            id=0, seek=0, start=chunk2_start, end=chunk2_start + 4.0,
+            text="and full fine so we should find three seats in the way.",
+            tokens=[], avg_logprob=0.0, compression_ratio=0.0,
+            no_speech_prob=0.0, words=new_words, temperature=None
+        )]
+        
+        # Call the function
+        text_to_remove, text_to_type = dictation._process_words_with_overlap(new_segments, chunk2_start, 2)
+        
+        # Verify: "shop." should be removed, "so we should find three seats in the way." should be typed
+        assert "shop." in text_to_remove or "shop" in text_to_remove, f"Expected 'shop.' in text_to_remove, got: {text_to_remove}"
+        assert "so" in text_to_type, f"Expected 'so' in text_to_type, got: {text_to_type}"
+        assert "we" in text_to_type, f"Expected 'we' in text_to_type, got: {text_to_type}"
+        
+        # The accumulated_words should be updated - "shop." should be replaced with "so we should find three seats in the way."
+        accumulated_text = " ".join(w.word for w in dictation.accumulated_words)
+        assert "shop." not in accumulated_text, f"Expected 'shop.' to be removed from accumulated_words, got: {accumulated_text}"
+        assert "so" in accumulated_text, f"Expected 'so' in accumulated_words, got: {accumulated_text}"
+        assert "we" in accumulated_text, f"Expected 'we' in accumulated_words, got: {accumulated_text}"
 
 
 class TestChunkSizes:
