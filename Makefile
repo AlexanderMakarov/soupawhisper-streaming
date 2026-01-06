@@ -1,4 +1,4 @@
-.PHONY: run run-stream run-no-stream test help
+.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs
 
 run:
 	@if command -v uv >/dev/null 2>&1; then \
@@ -58,3 +58,18 @@ test:
 		.venv/bin/pip install -e . pytest && \
 		.venv/bin/pytest dictate_tests.py; \
 	fi
+
+service-stop:
+	@systemctl --user stop soupawhisper || echo "Service not running or not installed"
+
+service-start:
+	@systemctl --user start soupawhisper || echo "Service not installed"
+
+service-restart:
+	@systemctl --user restart soupawhisper || echo "Service not installed"
+
+service-status:
+	@systemctl --user status soupawhisper || echo "Service not installed"
+
+service-logs:
+	@journalctl --user -u soupawhisper -f || echo "Service not installed"

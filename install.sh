@@ -203,7 +203,7 @@ main() {
     esac
     echo ""
     echo "Config: $CONFIG_DIR/config.ini"
-    echo "Hotkey: F10 (hold to record)"
+    echo "Hotkey: F12 (hold to record)"
     echo "Exit:   Ctrl+C"
 }
 

@@ -35,44 +35,27 @@ DEFAULT_HOTKEY = "f12"
 def load_config():
     config = configparser.ConfigParser()
 
-    # Defaults
-    defaults = {
-        "model": "base.en",
-        "device": "cpu",
-        "compute_type": "int8",
-        "key": DEFAULT_HOTKEY,
-        "default_streaming": "true",
-        "notifications": "true",
-        "clipboard": "true",
-        "auto_type": "true",
-        "auto_sentence": "true",
-        "typing_delay": "0.01",
-        "streaming_chunk_seconds": "3.0",
-        "streaming_overlap_seconds": "1.5",
-        "streaming_match_words_threshold_seconds": "0.1",
-    }
-
     if CONFIG_PATH.exists():
         config.read(CONFIG_PATH)
 
     return {
         # Whisper
-        "model": config.get("whisper", "model", fallback=defaults["model"]),
-        "device": config.get("whisper", "device", fallback=defaults["device"]),
-        "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
+        "model": config.get("whisper", "model", fallback="base.en"),
+        "device": config.get("whisper", "device", fallback="cpu"),
+        "compute_type": config.get("whisper", "compute_type", fallback="int8"),
         # Hotkey
-        "key": config.get("hotkey", "key", fallback=defaults["key"]),
+        "key": config.get("hotkey", "key", fallback=DEFAULT_HOTKEY),
         # Behavior
-        "default_streaming": config.getboolean("behavior", "default_streaming", fallback=defaults["default_streaming"] == "true"),
+        "default_streaming": config.getboolean("behavior", "default_streaming", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
         "clipboard": config.getboolean("behavior", "clipboard", fallback=True),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
-        "auto_sentence": config.getboolean("behavior", "auto_sentence", fallback=defaults["auto_sentence"] == "true"),
-        "typing_delay": config.getfloat("behavior", "typing_delay", fallback=float(defaults["typing_delay"])),
+        "auto_sentence": config.getboolean("behavior", "auto_sentence", fallback=True),
+        "typing_delay": config.getfloat("behavior", "typing_delay", fallback=0.01),
         # Streaming
-        "streaming_chunk_seconds": config.getfloat("streaming", "streaming_chunk_seconds", fallback=float(defaults["streaming_chunk_seconds"])),
-        "streaming_overlap_seconds": config.getfloat("streaming", "streaming_overlap_seconds", fallback=float(defaults["streaming_overlap_seconds"])),
-        "streaming_match_words_threshold_seconds": config.getfloat("streaming", "streaming_match_words_threshold_seconds", fallback=float(defaults["streaming_match_words_threshold_seconds"])),
+        "streaming_chunk_seconds": config.getfloat("streaming", "streaming_chunk_seconds", fallback=3.0),
+        "streaming_overlap_seconds": config.getfloat("streaming", "streaming_overlap_seconds", fallback=1.5),
+        "streaming_match_words_threshold_seconds": config.getfloat("streaming", "streaming_match_words_threshold_seconds", fallback=0.1),
     }
 
 
