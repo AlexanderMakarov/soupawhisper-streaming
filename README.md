@@ -1,14 +1,16 @@
 # SoupaWhisper
 
-A simple local press-to-toggle voice dictation tool for Linux using faster-whisper. Press a key to start transcribing, press again to stop. It automatically copies to clipboard and types into the active input. Supports both streaming and non-streaming modes.
+A simple local push-to-talk (not streaming) or press-to-toggle (streaming) voice dictation tool for Linux using faster-whisper.
+It automatically copies to clipboard and types into the active input. Streaming transcribes speech chunks as some silence is detected. Not-streaming transcribes the entire audio file at once.
 
-Note that push-to-talk is possible but can't be used with terminal applications.
+Note that push-to-talk is possible in a streaming mode but can't be used with terminal applications with paralell typing.
 
 ## Requirements
 
 - Python 3.10+
 - Poetry or uv
-- Linux with X11 (ALSA audio)
+- (not-streaming) Linux with X11 (ALSA audio)
+- (streaming) Any Linux supported by PyAudio
 
 ## Supported Distros
 
@@ -37,13 +39,13 @@ The installer will:
 
 ```bash
 # Ubuntu/Debian
-sudo apt install alsa-utils xclip xdotool libnotify-bin
+sudo apt install alsa-utils xclip xdotool libnotify-bin portaudio19-dev
 
 # Fedora
-sudo dnf install alsa-utils xclip xdotool libnotify
+sudo dnf install alsa-utils xclip xdotool libnotify portaudio-devel
 
 # Arch
-sudo pacman -S alsa-utils xclip xdotool libnotify
+sudo pacman -S alsa-utils xclip xdotool libnotify portaudio
 
 # Then install Python deps
 poetry install
@@ -93,25 +95,28 @@ make test          # Run tests in virtual environment
 
 ### Operation
 
-- Press the configured hotkey (default: **F10**) to start transcribing
-- Press again to stop → transcribes, copies to clipboard, and types into active input
+- Press the configured hotkey (default: **F12**) to start transcribing
+- (not-streaming) Release the hotkey → transcribes, copies to clipboard, and types into active input.
+- (streaming) Press the hotkey again to stop transcribing.
 - Press **Ctrl+C** to quit (when running manually)
 
 ### Streaming vs Non-Streaming Mode
 
 **Non-Streaming Mode** (default):
 - Records entire audio, then transcribes all at once
+- Uses `arecord` to record audio (only ALSA supported)
 - Text appears only after you stop recording
 - Better for short, precise dictations
 - Slightly more accurate for complete sentences
 - Use `--no-streaming` flag or set `default_streaming = false` in config
 
 **Streaming Mode**:
-- Transcribes audio in real-time chunks while recording
-- Text appears incrementally as you speak
-- Better for longer dictations
-- Lower latency for seeing results
-- Configured via `default_streaming = true` in config
+- Uses WebRTC VAD (Voice Activity Detection) to detect when you speak
+- Uses `pyaudio` to record audio (any audio backend supported by PyAudio)
+- Transcribes natural voice segments (sentences / phrases) one by one as they are detected
+- Text appears incrementally as you speak, but only after short silences
+- Better for longer dictations and more natural sentence boundaries
+- Use `--streaming` flag or set `default_streaming = true` in config
 
 ## Run as a systemd Service
 
@@ -123,6 +128,8 @@ The installer can set this up automatically. If you skipped it, run:
 
 ### Service Commands
 
+Use `make` commands or directly:
+
 ```bash
 systemctl --user start soupawhisper     # Start
 systemctl --user stop soupawhisper      # Stop
@@ -133,49 +140,7 @@ journalctl --user -u soupawhisper -f    # View logs
 
 ## Configuration
 
-Edit `~/.config/soupawhisper/config.ini`:
-
-```ini
-[whisper]
-# Model size: tiny.en, base.en, small.en, medium.en, large-v3
-model = base.en
-
-# Device: cpu or cuda (cuda requires cuDNN)
-device = cpu
-
-# Compute type: int8 for CPU, float16 for GPU
-compute_type = int8
-
-[hotkey]
-# Key to press to toggle recording: f10, f12, scroll_lock, pause, etc.
-key = f10
-
-[behavior]
-# Enable streaming mode by default
-default_streaming = true
-
-# Show desktop notification
-notifications = true
-
-# Copy resulting text to clipboard
-clipboard = true
-
-# Type text into active input field
-auto_type = true
-
-# Delay between typing characters in seconds
-typing_delay = 0.01
-
-[streaming]
-# Length of audio chunk in seconds (bigger = better quality, longer delay)
-streaming_chunk_seconds = 3.0
-
-# Overlap between chunks in seconds (should be less than chunk_seconds)
-streaming_overlap_seconds = 1.5
-
-# Threshold for matching words in overlapping chunks (seconds)
-streaming_match_words_threshold_seconds = 0.1
-```
+Edit `~/.config/soupawhisper/config.ini` - it contains explanations for each option.
 
 Create the config directory and file if it doesn't exist:
 ```bash

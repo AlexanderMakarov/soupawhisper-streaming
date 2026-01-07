@@ -1,4 +1,4 @@
-.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs
+.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record
 
 run:
 	@if command -v uv >/dev/null 2>&1; then \
@@ -73,3 +73,14 @@ service-status:
 
 service-logs:
 	@journalctl --user -u soupawhisper -f || echo "Service not installed"
+
+record:
+	@if command -v arecord >/dev/null 2>&1; then \
+		FILENAME="/tmp/recording_$$(date +%Y%m%d_%H%M%S).wav"; \
+		echo "Recording to $$FILENAME (Press Ctrl+C to stop)..."; \
+		arecord -f S16_LE -r 16000 -c 1 -t wav "$$FILENAME"; \
+		echo "Recording saved to $$FILENAME"; \
+	else \
+		echo "Error: arecord not found. Please install alsa-utils."; \
+		exit 1; \
+	fi
