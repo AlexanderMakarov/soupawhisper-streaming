@@ -9,8 +9,8 @@ Note that push-to-talk is possible in a streaming mode but can't be used with te
 
 - Python 3.10+
 - Poetry or uv
-- (not-streaming) Linux with X11 (ALSA audio)
-- (streaming) Any Linux supported by PyAudio
+- Linux with X11
+- Any Linux supported by PyAudio
 
 ## Supported Distros
 
@@ -39,13 +39,13 @@ The installer will:
 
 ```bash
 # Ubuntu/Debian
-sudo apt install alsa-utils xclip xdotool libnotify-bin portaudio19-dev
+sudo apt install xclip xdotool libnotify-bin portaudio19-dev
 
 # Fedora
-sudo dnf install alsa-utils xclip xdotool libnotify portaudio-devel
+sudo dnf install xclip xdotool libnotify portaudio-devel
 
 # Arch
-sudo pacman -S alsa-utils xclip xdotool libnotify portaudio
+sudo pacman -S xclip xdotool libnotify portaudio
 
 # Then install Python deps
 poetry install
@@ -104,7 +104,6 @@ make test          # Run tests in virtual environment
 
 **Non-Streaming Mode** (default):
 - Records entire audio, then transcribes all at once
-- Uses `arecord` to record audio (only ALSA supported)
 - Text appears only after you stop recording
 - Better for short, precise dictations
 - Slightly more accurate for complete sentences
@@ -112,9 +111,8 @@ make test          # Run tests in virtual environment
 
 **Streaming Mode**:
 - Uses WebRTC VAD (Voice Activity Detection) to detect when you speak
-- Uses `pyaudio` to record audio (any audio backend supported by PyAudio)
 - Transcribes natural voice segments (sentences / phrases) one by one as they are detected
-- Text appears incrementally as you speak, but only after short silences
+- Text appears incrementally as you speak, after short silence breaks are detected
 - Better for longer dictations and more natural sentence boundaries
 - Use `--streaming` flag or set `default_streaming = true` in config
 
@@ -148,16 +146,41 @@ mkdir -p ~/.config/soupawhisper
 cp config.example.ini ~/.config/soupawhisper/config.ini
 ```
 
+### Audio Device Configuration
+
+Both streaming and non-streaming modes use PyAudio for audio recording. To configure which audio input device to use:
+
+1. **Find available devices**: Run the application with `--verbose` flag to see a list of available audio input devices in the logs.
+
+2. **Set device in config**: Edit `~/.config/soupawhisper/config.ini` and set the `audio_input_device` option in the `[streaming]` section:
+   ```ini
+   [streaming]
+   audio_input_device = 0
+   ```
+   
+   You can specify either:
+   - A device index (integer, e.g., `0`, `8`)
+   - A partial device name (string, e.g., `"pulse"`, `"HDA Intel"`) - the first matching device will be used
+
+3. **Default behavior**: If `audio_input_device` is not set or empty, PyAudio will use the system default input device.
+
 ## Troubleshooting
 
 **No audio recording:**
 ```bash
-# Check your input device
-arecord -l
+# Run with --verbose to see available audio devices
+poetry run python dictate.py --verbose
+# OR
+uv run python dictate.py --verbose
 
-# Test recording
-arecord -d 3 test.wav && aplay test.wav
+# The logs will show available input devices with their indices
+# Then set audio_input_device in your config file
 ```
+
+If no audio is detected, the application will show a notification with available devices. Check that:
+- Your microphone is connected and working
+- The correct audio input device is selected in your system settings
+- The `audio_input_device` setting in config matches your device index or name
 
 **Permission issues with keyboard:**
 ```bash
@@ -205,9 +228,11 @@ make test
 
 # TODO/Roadmap
 
-- [ ] Migrate everything to PyAudio.
-- [ ] Fix issue with skipping the first word.
+- [x] Migrate everything to PyAudio.
+- [x] Fix issue with skipping the first word.
 - [ ] Fix issue with not pasting final text to input field.
 - [ ] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
-- [ ] Add context with the first word. E.g. "Python" at the start appends `initial_prompt` (or `prefix`) parameter to "Speech about task in Python programming language".
+- [ ] Add setting to keep context of the previous transcription. E.g. use previous transcription as `initial_prompt` parameter.
+- [ ] Add context with the first word. E.g. "Python" word at the start turns `initial_prompt` parameter to "Speech about task in Python programming language".
+- [ ] Set language with the first word.
 - [ ] Add ability to tune `model.transcribe()` parameters via config.

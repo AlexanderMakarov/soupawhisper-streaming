@@ -44,6 +44,8 @@ def load_config():
         "model": config.get("whisper", "model", fallback="base.en"),
         "device": config.get("whisper", "device", fallback="cpu"),
         "compute_type": config.get("whisper", "compute_type", fallback="int8"),
+        # Input device
+        "audio_input_device": config.get("input", "audio_input_device", fallback=None),
         # Hotkey
         "key": config.get("hotkey", "key", fallback=DEFAULT_HOTKEY),
         # Behavior
@@ -55,11 +57,12 @@ def load_config():
         "typing_delay": config.getfloat("behavior", "typing_delay", fallback=0.01),
         "save_recordings": config.getboolean("behavior", "save_recordings", fallback=False),
         # Streaming
+        "min_speech_length_seconds": config.getfloat("streaming", "min_speech_length_seconds", fallback=1.0),
         "vad_silence_threshold_seconds": config.getfloat("streaming", "vad_silence_threshold_seconds", fallback=1.0),
         "vad_sample_rate": config.getint("streaming", "vad_sample_rate", fallback=16000),
-        "vad_chunk_size_ms": config.getfloat("streaming", "vad_chunk_size_ms", fallback=512.0),
+        "vad_chunk_size_ms": config.getfloat("streaming", "vad_chunk_size_ms", fallback=20.0),
+        "vad_min_speech_chunks": config.getint("streaming", "vad_min_speech_chunks", fallback=10),
         "vad_threshold": config.getfloat("streaming", "vad_threshold", fallback=0.5),
-        "audio_input_device": config.get("streaming", "audio_input_device", fallback=None),
     }
 
 
@@ -119,13 +122,18 @@ class Dictation:
         self.config = config
         self.hotkey = get_hotkey(config["key"])
         self.recording = False
-        self.record_process = None
-        self.temp_file = None
         self.model = None
         self.model_loaded = threading.Event()
         self.model_error = None
         self.running = True
         self.typer: Optional[Typer] = None
+        self.audio_interface: Optional[pyaudio.PyAudio] = None
+        self.audio_stream = None
+        self.audio_thread: Optional[threading.Thread] = None
+        self.audio_data: list[np.ndarray] = []
+        self.sample_rate = 16000
+        self.frames_per_buffer = 4096  # ~0.25 seconds of audio
+        self._device_help_shown = False
 
         if self.config["auto_type"]:
             self.typer = Typer(
@@ -156,276 +164,6 @@ class Dictation:
     def _finish_model_loading(self):
         logger.info(f"Hold [{self.get_hotkey_name()}] to start dictation, release to transcribe. Press Ctrl+C to quit.")
 
-    def notify(self, title, message, icon="dialog-information", timeout=2000):
-        """Send a desktop notification."""
-        if not self.config["notifications"]:
-            return
-        logger.debug("[idle] Showing notification: %s, %s, %s, %s", title, message, icon, timeout)
-        subprocess.run(
-            [
-                "notify-send",
-                "-a", "SoupaWhisper",
-                "-i", icon,
-                "-t", str(timeout),
-                "-h", "string:x-canonical-private-synchronous:soupawhisper",
-                title,
-                message
-            ],
-            capture_output=True
-        )
-
-    def _segments_to_text(self, segments: Iterable[Segment], auto_sentence: bool) -> str:
-        """Format text as a sentence: capitalize first letter and add period at end if needed."""
-        text = " ".join(segment.text.strip() for segment in segments)
-        if not text or not self.config.get("auto_sentence", False):
-            return text
-        text = text.strip()
-        if not text:
-            return text
-        if auto_sentence and len(text) > 0:
-            text = text[0].upper() + text[1:]
-        if auto_sentence and not text.endswith(('.', '!', '?', ':', ';')):
-            text = text + '.'
-        return text
-
-    def _transcribe_audio_file(self, audio_file_path: str) -> Tuple[str, float]:
-        """
-        Wait for model to load and transcribe an audio file.
-        
-        Args:
-            audio_file_path: Path to the audio file to transcribe
-            
-        Returns:
-            Tuple of (transcribed_text, audio_duration)
-            
-        Raises:
-            RuntimeError: If model failed to load or is not available
-            FileNotFoundError: If audio file does not exist
-            Exception: If transcription fails
-        """
-        # Wait for model loading to finish.
-        self.model_loaded.wait()
-        if self.model_error:
-            logger.error("Cannot transcribe: model failed to load")
-            self.notify("Error", "Model failed to load", "dialog-error", 3000)
-            return "", 0.0
-        if self.model is None:
-            logger.error("Cannot transcribe: model not loaded")
-            return "", 0.0
-        # Transcribe audio.
-        segments, info = self.model.transcribe(
-            audio_file_path,
-            beam_size=5,
-            vad_filter=True,
-        )
-        # Convert segments to text.
-        text = self._segments_to_text(segments, self.config["auto_sentence"])
-        return text, info.duration
-
-    def on_press(self, key):
-        if key == self.hotkey:
-            self.start_recording()
-
-    def on_release(self, key):
-        if key == self.hotkey:
-            self.stop_recording()
-
-    def stop(self):
-        logger.info("\nExiting...")
-        self.running = False
-
-    def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release,
-        ) as listener:
-            listener.join()
-
-    def start_record_process(self, output_file: str, duration: Optional[float] = None, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL):
-        """
-        Start arecord process with shared parameters, writing WAV file.
-        
-        Args:
-            output_file: Path to write WAV file to
-            duration: Optional duration in seconds (if None, records until terminated)
-            stdout: Where to redirect stdout (default: DEVNULL)
-            stderr: Where to redirect stderr (default: DEVNULL)
-        
-        Returns:
-            subprocess.Popen instance
-        """
-        cmd = [
-            "arecord",
-            "-f", "S16_LE",  # Format: 16-bit little-endian
-            "-r", "16000",   # Sample rate: 16kHz (what Whisper expects)
-            "-c", "1",       # Mono
-            "-t", "wav",
-        ]
-        if duration is not None:
-            cmd.extend(["-d", str(int(duration))])
-        cmd.append(output_file)
-        return subprocess.Popen(
-            cmd,
-            stdout=stdout,
-            stderr=stderr
-        )
-
-    def start_recording(self):
-        if self.recording:
-            return
-        self.model_loaded.wait()
-        if self.model_error or self.model is None:
-            logger.error("Recording is not ready yet.")
-            return
-
-        self.recording = True
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.temp_file = os.path.join(tempfile.gettempdir(), f"recording_{timestamp}.wav")
-
-        # Record using arecord (ALSA) - works on most Linux systems
-        self.record_process = self.start_record_process(self.temp_file)
-        logger.info("[record] Recording...")
-        self.notify("Recording...", f"Release {self.get_hotkey_name().upper()} when done", "audio-input-microphone", 2000)
-
-    def stop_recording(self):
-        if not self.recording:
-            return
-
-        self.recording = False
-
-        if self.record_process:
-            self.record_process.terminate()
-            self.record_process.wait()
-            self.record_process = None
-
-        logger.info("Recording stopped, transcribing...")
-        self.notify("Transcribing...", "Processing your speech", "emblem-synchronizing", 1500)
-
-        # Transcribe.
-        temp_file_name = self.temp_file if self.temp_file else None
-        if temp_file_name and not isinstance(temp_file_name, str):
-            if hasattr(temp_file_name, 'name'):
-                temp_file_name = temp_file_name.name
-            else:
-                temp_file_name = str(temp_file_name) if temp_file_name else None
-        if temp_file_name and not isinstance(temp_file_name, str):
-            temp_file_name = None
-        try:
-            if not temp_file_name or not isinstance(temp_file_name, str) or not os.path.exists(temp_file_name):
-                logger.error(f"Cannot transcribe: audio file not found: {temp_file_name}")
-                return
-            # Transcribe audio.
-            text, duration = self._transcribe_audio_file(temp_file_name)
-            if text:
-                logger.info(f"Transcribed {duration:.2f}s: {text}")
-                if self.config["clipboard"]:
-                    process = subprocess.Popen(
-                        ["xclip", "-selection", "clipboard"],
-                        stdin=subprocess.PIPE
-                    )
-                    process.communicate(input=text.encode())
-                    logger.info(f"Pasted to clipboard: {text}")
-                if self.config["auto_type"] and self.typer:
-                    self.typer.type_rewrite(text, 0)
-                if self.config["notifications"]:
-                    self.notify(
-                        f"Transcribed {duration:.2f}s speech:",
-                        text[:100] + ("..." if len(text) > 100 else ""),
-                        "emblem-ok-symbolic",
-                        3000
-                    )
-            else:
-                logger.info("No speech detected")
-                self.notify("No speech detected", "Check your microphone or try speaking louder", "dialog-warning", 2000)
-        except Exception as e:
-            logger.error(f"Error transcribing: {e}", exc_info=True)
-            self.notify("Error", str(e)[:50], "dialog-error", 3000)
-        finally:
-            # Cleanup temp file unless save_recordings is enabled.
-            if temp_file_name and isinstance(temp_file_name, str) and not self.config["save_recordings"]:
-                if os.path.exists(temp_file_name):
-                    os.unlink(temp_file_name)
-
-    def transcribe_file(self, wav_file_path: str) -> str:
-        """
-        Transcribe a WAV file using non-streaming transcription.
-        Expects WAV files (16-bit, 16kHz, mono).
-
-        Args:
-            wav_file_path: Path to the WAV file to transcribe
-
-        Returns:
-            The transcribed text
-        """
-        logger.info(f"[file] Transcribing WAV file: {wav_file_path}")
-        try:
-            text, duration = self._transcribe_audio_file(wav_file_path)
-            if text:
-                logger.info(f"[file] Transcribed {duration:.2f}s: {text}")
-            else:
-                logger.info("[file] No speech detected")
-            return text
-        except Exception as e:
-            logger.error(f"[file] Error transcribing: {e}", exc_info=True)
-            raise
-
-
-class StreamingDictation(Dictation):
-    """Streaming dictation mode.
-    """
-
-    def __init__(self, config: dict):
-        # Initialize base class (sets up config, hotkey, model loading, etc.)
-        super().__init__(config)
-        assert self.config["auto_type"], "auto_type must be True for streaming mode"
-        self.vad_silence_threshold_seconds = config["vad_silence_threshold_seconds"]
-        self.vad_sample_rate = config["vad_sample_rate"]
-        self.vad_chunk_size_ms = config["vad_chunk_size_ms"]
-        self.vad_threshold = config["vad_threshold"]
-        self.streaming_match_words_threshold_seconds = 0.1
-
-        # Validate vad_chunk_size_ms - webrtcvad only supports 10ms, 20ms, or 30ms
-        if self.vad_chunk_size_ms not in [10, 20, 30]:
-            raise ValueError(f"vad_chunk_size_ms must be 10, 20, or 30 (got {self.vad_chunk_size_ms}). webrtcvad only supports these frame sizes.")
-
-        self.transcription_queue: queue.Queue[np.ndarray | None] = queue.Queue()
-        self.typing_queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
-        self.file_saving_queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue()
-
-        self.stopping = False
-        self.audio_interface: Optional[pyaudio.PyAudio] = None
-        self.audio_stream = None
-        self.audio_thread: Optional[threading.Thread] = None
-        self.transcription_thread: Optional[threading.Thread] = None
-        self.typing_thread: Optional[threading.Thread] = None
-        self.file_saving_thread: Optional[threading.Thread] = None
-        self.vad = webrtcvad.Vad(int(self.vad_threshold))
-        self.vad_frame_size_ms = self.vad_chunk_size_ms
-        self.vad_frame_size = int(self.vad_sample_rate * self.vad_frame_size_ms / 1000)
-        self.in_speech = False
-        self.silence_duration = 0.0
-        self.current_segment_chunks: list[np.ndarray] = []
-        self.accumulated_text = ""
-        self._device_help_shown = False
-        self.speech_start_time: Optional[float] = None
-        self.total_processed_time = 0.0
-        self.file_mode = False
-        self.consecutive_speech_chunks = 0
-        self.min_speech_chunks = 5  # TODO move to config
-        self.speech_start_logged = False
-        self.last_speech_time: Optional[float] = None
-
-        # Create typer once in constructor
-        self.typer: Optional[Typer] = None
-        if self.config["auto_type"]:
-            self.typer = Typer(
-                delay_ms=int(self.config["typing_delay"] * 1000),
-                start_delay_ms=100
-            )
-
-    def _finish_model_loading(self):
-        logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
-
     def _get_input_device_index(self) -> Optional[int]:
         """Get the input device index from config, or None to use default."""
         audio_input_device = self.config.get("audio_input_device")
@@ -453,31 +191,369 @@ class StreamingDictation(Dictation):
             logger.warning(f"[record] Audio device '{audio_input_device}' not found, using default")
             return None
 
-    def _show_device_help(self):
-        """Show available audio devices and instructions when no audio is detected."""
-        if self._device_help_shown:
-            return
-        self._device_help_shown = True
+    def _get_available_input_devices(self) -> list[tuple[int, str, int]]:
+        """
+        Get list of available audio input devices.
+
+        Returns:
+            List of tuples (device_index, device_name, max_input_channels)
+        """
         if self.audio_interface is None:
             self.audio_interface = pyaudio.PyAudio()
-        logger.error("[record] No audio detected. Available input devices:")
-        devices_list = []
+        devices = []
         for i in range(self.audio_interface.get_device_count()):
             try:
                 info = self.audio_interface.get_device_info_by_index(i)
                 max_inputs = int(info.get('maxInputChannels', 0))
                 if max_inputs > 0:
                     device_name = str(info.get('name', ''))
-                    devices_list.append(f"  {i}: {device_name}")
-                    logger.error(f"  {i}: {device_name}")
+                    devices.append((i, device_name, max_inputs))
             except Exception:
                 pass
-        devices_text = "\n".join(devices_list[:5])
-        if len(devices_list) > 5:
-            devices_text += f"\n  ... and {len(devices_list) - 5} more"
+        return devices
+
+    def _show_device_help(self):
+        """Show available audio devices and instructions when no audio is detected."""
+        if self._device_help_shown:
+            return
+        self._device_help_shown = True
+        logger.error("[record] No audio detected. Building list of devices...")
+        devices = self._get_available_input_devices()
+        devices_list = [f"  {i}: {name}" for i, name, _ in devices]
+        devices_text = "\n".join(devices_list[:8])
+        if len(devices_list) > 8:
+            devices_text += f"\n  ... and {len(devices_list) - 8} more"
         config_path = CONFIG_PATH
-        message = f"Set 'audio_input_device' in {config_path}\n\nExample devices:\n{devices_text}"
-        self.notify("No audio detected - check device", message, "dialog-warning", 5000)
+        message = f"Set 'audio_input_device' in {config_path}\nSupported (by pyaudio, not on this machine!) devices:\n{devices_text}"
+        self.notify("No audio detected - check device", message, logging.WARNING, 10000)
+
+    def _start_pyaudio_stream(self, frames_per_buffer: int) -> Optional[pyaudio.Stream]:
+        """
+        Start a pyaudio stream for recording.
+
+        Args:
+            frames_per_buffer: Number of frames per buffer
+
+        Returns:
+            pyaudio.Stream instance or None if failed
+        """
+        if self.audio_interface is None:
+            self.audio_interface = pyaudio.PyAudio()
+        input_device_index = self._get_input_device_index()
+        if input_device_index is not None:
+            device_info = self.audio_interface.get_device_info_by_index(input_device_index)
+            logger.info(f"[record] Using audio input device {input_device_index}: {device_info['name']}")
+        else:
+            default_device = self.audio_interface.get_default_input_device_info()
+            logger.info(f"[record] Using default audio input device {default_device['index']}: {default_device['name']}")
+            input_device_index = int(default_device['index'])
+        try:
+            audio_stream = self.audio_interface.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.sample_rate,
+                input=True,
+                input_device_index=input_device_index,
+                frames_per_buffer=frames_per_buffer
+            )
+            return audio_stream
+        except OSError as e:
+            logger.error(f"[record] Failed to open audio stream: {e}", exc_info=True)
+            devices_text = "\n".join([f"  {i}: {name} (inputs: {max_inputs})" for i, name, max_inputs in self._get_available_input_devices()])
+            self.notify("Error", f"Failed to open audio device: {str(e)[:50]}...\nSupported (by pyaudio, not on this machine!) devices:\n{devices_text}", logging.ERROR, 10000)
+            return None
+
+    def notify(self, title, message, level=logging.INFO, timeout=2000, icon=None):
+        """Send a desktop notification."""
+        if not self.config["notifications"]:
+            return
+        icon_map = {
+            logging.DEBUG: "dialog-information",
+            logging.INFO: "dialog-information",
+            logging.WARNING: "dialog-warning",
+            logging.ERROR: "dialog-error",
+            logging.CRITICAL: "dialog-error",
+        }
+        if icon is None:
+            icon = icon_map.get(level, "dialog-information")
+        log_method_map = {
+            logging.DEBUG: logger.debug,
+            logging.INFO: logger.info,
+            logging.WARNING: logger.warning,
+            logging.ERROR: logger.error,
+            logging.CRITICAL: logger.critical,
+        }
+        log_method = log_method_map.get(level, logger.info)
+        log_method("[idle] Showing notification: %s, %s, %s, %s", title, message, icon, timeout)
+        subprocess.run(
+            [
+                "notify-send",
+                "-a", "SoupaWhisper",
+                "-i", icon,
+                "-t", str(timeout),
+                "-h", "string:x-canonical-private-synchronous:soupawhisper",
+                title,
+                message
+            ],
+            capture_output=True
+        )
+
+    def _segments_to_text(self, segments: Iterable[Segment], auto_sentence: bool) -> str:
+        """Format text as a sentence: capitalize first letter and add period at end if needed."""
+        text = " ".join(segment.text.strip() for segment in segments)
+        if not text or not self.config.get("auto_sentence", False):
+            return text
+        text = text.strip()
+        if not text:
+            return text
+        if auto_sentence and len(text) > 0:
+            text = text[0].upper() + text[1:]
+        if auto_sentence and not text.endswith(('.', '!', '?', ':', ';')):
+            text = text + '.'
+        return text
+
+    def _transcribe_audio_array(self, audio_array: np.ndarray) -> Tuple[str, float]:
+        """
+        Check if model is loaded and transcribe an audio numpy array.
+
+        Args:
+            audio_array: numpy array of audio data (int16 format, 16kHz, mono)
+
+        Returns:
+            Tuple of (transcribed_text, audio_duration)
+
+        Raises:
+            RuntimeError: If model failed to load or is not available
+            Exception: If transcription fails
+        """
+        if self.model_error:
+            self.notify("Error", "Model failed to load", logging.ERROR, 5000)
+            return "", 0.0
+        if self.model is None:
+            logger.error("Cannot transcribe: model not loaded")
+            return "", 0.0
+        # Convert int16 to float32 and normalize to [-1.0, 1.0]
+        if audio_array.dtype == np.int16:
+            audio_array = audio_array.astype(np.float32) / 32768.0
+        # Transcribe audio.
+        segments, info = self.model.transcribe(
+            audio_array,
+            vad_filter=True,
+        )
+        # Convert segments to text.
+        text = self._segments_to_text(segments, self.config["auto_sentence"])
+        return text, info.duration
+
+    def on_press(self, key):
+        if key == self.hotkey:
+            self.start_recording()
+
+    def on_release(self, key):
+        if key == self.hotkey:
+            self.stop_recording()
+
+    def stop(self):
+        logger.info("\nExiting...")
+        self.running = False
+
+    def run(self):
+        with keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+        ) as listener:
+            listener.join()
+
+    def _audio_recording_worker(self):
+        """Audio recording worker thread that collects audio data into one array."""
+        chunk_size = 4096  # ~0.25 seconds of audio
+        try:
+            while self.recording:
+                if not self.audio_stream:
+                    break
+                data = self.audio_stream.read(chunk_size, exception_on_overflow=False)
+                if not data:
+                    continue
+                samples = np.frombuffer(data, dtype=np.int16)
+                self.audio_data.append(samples)
+        except Exception as e:
+            logger.error(f"[record] Error in audio recording worker: {e}", exc_info=True)
+
+    def start_recording(self):
+        if self.recording:
+            return
+        self.model_loaded.wait()
+        if self.model_error or self.model is None:
+            logger.error("Recording is not ready yet.")
+            return
+
+        self.recording = True
+        self.audio_data = []
+        self._device_help_shown = False
+
+        self.audio_stream = self._start_pyaudio_stream(self.frames_per_buffer)
+        if self.audio_stream is None:
+            self.recording = False
+            return
+
+        self.audio_thread = threading.Thread(
+            target=self._audio_recording_worker,
+            daemon=True,
+            name="audio_recording_worker"
+        )
+        self.audio_thread.start()
+        self.notify("Recording...", f"Release {self.get_hotkey_name().upper()} when done", logging.INFO, 2000, "emblem-synchronizing")
+
+    def stop_recording(self):
+        if not self.recording:
+            return
+
+        self.recording = False
+
+        if self.audio_thread:
+            self.audio_thread.join(timeout=2.0)
+
+        if self.audio_stream:
+            try:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+            except Exception:
+                pass
+            self.audio_stream = None
+
+        self.notify("Transcribing...", "Processing your speech", logging.INFO, 1500)
+
+        try:
+            if not self.audio_data:
+                logger.error("Cannot transcribe: no audio data recorded")
+                if not self._device_help_shown:
+                    self._show_device_help()
+                return
+
+            audio_array = np.concatenate(self.audio_data)
+            if self.config.get("save_recordings", False):
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                file_path = os.path.join(tempfile.gettempdir(), f"recording_{timestamp}.wav")
+                try:
+                    with wave.open(file_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(self.sample_rate)
+                        wf.writeframes(audio_array.tobytes())
+                    logger.info(f"[record] Saved recording to {file_path}")
+                except Exception as e:
+                    logger.error(f"[record] Failed to save recording: {e}", exc_info=True)
+
+            text, duration = self._transcribe_audio_array(audio_array)
+            if text:
+                logger.info(f"Transcribed {duration:.2f}s: {text}")
+                if self.config["clipboard"]:
+                    process = subprocess.Popen(
+                        ["xclip", "-selection", "clipboard"],
+                        stdin=subprocess.PIPE
+                    )
+                    process.communicate(input=text.encode())
+                    logger.info(f"Pasted to clipboard: {text}")
+                if self.config["auto_type"] and self.typer:
+                    self.typer.type_rewrite(text, 0)
+                if self.config["notifications"]:
+                    self.notify(
+                        f"Transcribed {duration:.2f}s speech:",
+                        text[:100] + ("..." if len(text) > 100 else ""),
+                        logging.INFO,
+                        3000,
+                        "emblem-ok-symbolic",
+                    )
+            else:
+                logger.info("No speech detected")
+                if not self._device_help_shown:
+                    self._show_device_help()
+                else:
+                    self.notify("No speech detected", "Check your microphone or try speaking louder", logging.WARNING, 2000)
+        except Exception as e:
+            logger.error(f"Error transcribing: {e}", exc_info=True)
+            self.notify("Error", str(e)[:50], logging.ERROR, 3000)
+        finally:
+            self.audio_data = []
+
+    def transcribe_file(self, wav_file_path: str) -> str:
+        """
+        Transcribe a WAV file using non-streaming transcription.
+        Expects WAV files (16-bit, 16kHz, mono).
+
+        Args:
+            wav_file_path: Path to the WAV file to transcribe
+
+        Returns:
+            The transcribed text
+        """
+        logger.info(f"[file] Transcribing WAV file: {wav_file_path}")
+        try:
+            with wave.open(wav_file_path, "rb") as wf:
+                n_frames = wf.getnframes()
+                audio_data = wf.readframes(n_frames)
+                audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            text, duration = self._transcribe_audio_array(audio_array)
+            if text:
+                logger.info(f"[file] Transcribed {duration:.2f}s: {text}")
+            else:
+                logger.info("[file] No speech detected")
+            return text
+        except Exception as e:
+            logger.error(f"[file] Error transcribing: {e}", exc_info=True)
+            raise
+
+
+class StreamingDictation(Dictation):
+    """Streaming dictation mode.
+    """
+
+    def __init__(self, config: dict):
+        # Initialize base class (sets up config, hotkey, model loading, etc.)
+        super().__init__(config)
+        self.min_speech_length_seconds = config["min_speech_length_seconds"]
+        self.vad_silence_threshold_seconds = config["vad_silence_threshold_seconds"]
+        self.vad_sample_rate = config["vad_sample_rate"]
+        self.vad_chunk_size_ms = config["vad_chunk_size_ms"]
+        self.vad_min_speech_chunks = config["vad_min_speech_chunks"]
+        # Validate vad_chunk_size_ms - webrtcvad only supports 10ms, 20ms, or 30ms
+        if self.vad_chunk_size_ms not in [10, 20, 30]:
+            raise ValueError(f"vad_chunk_size_ms must be 10, 20, or 30 (got {self.vad_chunk_size_ms}). webrtcvad only supports these frame sizes.")
+        self.vad_threshold = config["vad_threshold"]
+        self.vad_frame_size_ms = self.vad_chunk_size_ms
+        self.vad_frame_size = int(self.vad_sample_rate * self.vad_frame_size_ms / 1000)
+
+        # Workers, queues, etc.
+        self.audio_interface: Optional[pyaudio.PyAudio] = None
+        self.transcription_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        self.typing_queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
+        self.file_saving_queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue()
+        self.audio_stream = None
+        self.audio_thread: Optional[threading.Thread] = None
+        self.transcription_thread: Optional[threading.Thread] = None
+        self.typing_thread: Optional[threading.Thread] = None
+        self.file_saving_thread: Optional[threading.Thread] = None
+        self.vad = webrtcvad.Vad(int(self.vad_threshold))
+        self.typer: Optional[Typer] = None
+        if self.config["auto_type"]:
+            self.typer = Typer(
+                delay_ms=int(self.config["typing_delay"] * 1000),
+                start_delay_ms=100
+            )
+
+        # State variables.
+        self.in_speech = False
+        self.file_mode = False
+        self.stopping = False
+        self.recording_start_time: float = 0.0
+        self.speech_segment_chunks: list[np.ndarray] = []
+        self.speech_start_time: Optional[float] = None
+        self.speech_silence_duration: float = 0.0
+        self.speech_end_time: float = 0.0
+        self.accumulated_text = ""
+        self._device_help_shown = False
+
+    def _finish_model_loading(self):
+        logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
     def on_press(self, key):
         if key == self.hotkey:
@@ -497,24 +573,19 @@ class StreamingDictation(Dictation):
             logger.error("[record] Recording is already started")
             return
         if self.stopping:
-            logger.error("[record] Cannot start recording: previous recording is still shutting down")
-            self.notify("Error", "Previous recording is still shutting down. Please wait a moment.", "dialog-error", 3000)
+            self.notify("Error", "Previous recording is still shutting down. Please wait a moment.", logging.ERROR, 3000)
             return
         self.model_loaded.wait()
         if self.model_error or self.model is None:
-            logger.error("[record] Cannot start recording yet")
-            self.notify("Error", "Model is not loaded yet", "dialog-error", 3000)
+            self.notify("Error", "Model is not loaded yet", logging.ERROR, 3000)
             return
         # Reset transcription state.
         self.recording = True
         self.accumulated_text = ""
         self.in_speech = False
-        self.silence_duration = 0.0
-        self.current_segment_chunks = []
+        self.speech_segment_chunks = []
         self._device_help_shown = False
-        self.total_processed_time = 0.0
         self.speech_start_time = None
-        self.last_speech_time = None
         # Clear queues to remove any leftover sentinels from previous recording
         while not self.transcription_queue.empty():
             try:
@@ -526,40 +597,10 @@ class StreamingDictation(Dictation):
                 self.typing_queue.get_nowait()
             except queue.Empty:
                 break
-        if self.audio_interface is None:
-            self.audio_interface = pyaudio.PyAudio()
-        input_device_index = self._get_input_device_index()
-        if input_device_index is not None:
-            device_info = self.audio_interface.get_device_info_by_index(input_device_index)
-            logger.info(f"[record] Using audio input device {input_device_index}: {device_info['name']}")
-        else:
-            default_device = self.audio_interface.get_default_input_device_info()
-            logger.info(f"[record] Using default audio input device {default_device['index']}: {default_device['name']}")
-            input_device_index = int(default_device['index'])
         frames_per_buffer = int(self.vad_sample_rate * self.vad_chunk_size_ms / 1000.0)
-        try:
-            self.audio_stream = self.audio_interface.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.vad_sample_rate,
-                input=True,
-                input_device_index=input_device_index,
-                frames_per_buffer=frames_per_buffer
-            )
-        except OSError as e:
-            logger.error(f"[record] Failed to open audio stream: {e}")
-            logger.error(f"[record] Available input devices:")
-            for i in range(self.audio_interface.get_device_count()):
-                try:
-                    info = self.audio_interface.get_device_info_by_index(i)
-                    max_inputs = int(info.get('maxInputChannels', 0))
-                    if max_inputs > 0:
-                        device_name = str(info.get('name', ''))
-                        logger.error(f"  {i}: {device_name} (inputs: {max_inputs})")
-                except Exception:
-                    pass
+        self.audio_stream = self._start_pyaudio_stream(frames_per_buffer)
+        if self.audio_stream is None:
             self.recording = False
-            self.notify("Error", f"Failed to open audio device: {str(e)[:50]}...", "dialog-error", 10000)
             return
         self.audio_thread = threading.Thread(
             target=self._continuous_audio_stream_worker,
@@ -568,6 +609,7 @@ class StreamingDictation(Dictation):
             name="audio_stream_worker"
         )
         self.audio_thread.start()
+        self.recording_start_time = time.monotonic()
         self.transcription_thread = threading.Thread(target=self._transcription_worker, daemon=True)
         self.transcription_thread.start()
         if self.config["auto_type"]:
@@ -581,22 +623,7 @@ class StreamingDictation(Dictation):
             self.file_saving_thread = threading.Thread(target=self._file_saving_worker, daemon=True)
             self.file_saving_thread.start()
         # Notify about recording start.
-        logger.info("[record] Recording (streaming mode)...")
-        self.notify("Recording...", f"Press {self.get_hotkey_name().upper()} when done", "audio-input-microphone", 1500)
-
-    def _finalize_segment(self):
-        """Finalize any remaining speech segment after processing is complete."""
-        if self.in_speech and self.current_segment_chunks:
-            segment = np.concatenate(self.current_segment_chunks)
-            segment_audio_duration = len(segment) / float(self.vad_sample_rate)
-            speech_end_time = self.last_speech_time if self.last_speech_time is not None else self.total_processed_time
-            if self.speech_start_time is not None:
-                logger.info(f"[SAD] {speech_end_time:.3f} speech finished, handling chunk of {segment_audio_duration:.3f} seconds audio")
-            self.transcription_queue.put(segment)
-            self.in_speech = False
-            self.current_segment_chunks = []
-            self.speech_start_time = None
-            self.last_speech_time = None
+        self.notify("Recording...", f"Press {self.get_hotkey_name().upper()} when done", logging.INFO, 1500, "audio-input-microphone")
 
     def _continuous_audio_stream_worker(self, frames_per_buffer: int):
         chunk_duration = frames_per_buffer / float(self.vad_sample_rate)
@@ -604,110 +631,105 @@ class StreamingDictation(Dictation):
             while self.recording:
                 if not self.audio_stream:
                     break
+                chunk_start_time = time.monotonic() - self.recording_start_time
                 data = self.audio_stream.read(frames_per_buffer, exception_on_overflow=False)
                 if not data:
                     continue
-                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                self._process_audio_chunk(samples, chunk_duration)
+                samples = np.frombuffer(data, dtype=np.int16)
+                self._process_audio_chunk(samples, chunk_start_time, chunk_duration)
         except Exception as e:
             logger.error(f"[record] Error in audio stream worker: {e}", exc_info=True)
         finally:
             self._finalize_segment()
 
-    def _process_audio_chunk(self, frame: np.ndarray, chunk_duration: float):
+    def _reset_speech_mode(self):
+        self.in_speech = False
+        self.speech_segment_chunks = []
+        self.speech_start_time = None
+        self.speech_silence_duration = 0.0
+        self.speech_end_time = 0.0
+
+    def _process_audio_chunk(self, frame: np.ndarray, frame_start_time: float, frame_duration: float):
         """
-        Process a single audio chunk using VAD to determine segment boundaries.
-        All chunks (both speech and non-speech) are included in segments between
-        "speech started" and "speech finished" events.
+        Process a single audio frame using VAD to determine segment boundaries.
         """
-        chunk_start_time = self.total_processed_time
-        self.total_processed_time += chunk_duration
-        # Use VAD to detect if this chunk contains speech.
+        if len(frame) != self.vad_frame_size:
+            logger.error(f"[vad] Invalid frame size: expected {self.vad_frame_size} samples, got {len(frame)}")
+        # Use VAD to detect if this frame contains speech.
         has_speech = False
         try:
-            frame_int16 = (frame * 32768.0).astype(np.int16)
-            frame_bytes = frame_int16.tobytes()
-            if len(frame_bytes) == 2 * self.vad_frame_size:
-                has_speech = self.vad.is_speech(frame_bytes, self.vad_sample_rate)
-            else:
-                logger.error(f"[vad] Invalid frame size: expected {2 * self.vad_frame_size} bytes, got {len(frame_bytes)}")
+            has_speech = self.vad.is_speech(frame.tobytes(), self.vad_sample_rate)
         except Exception as e:
             logger.error(f"[vad] VAD processing failed: {e}", exc_info=True)
+            self.notify("Error", f"VAD processing failed: {e}", logging.ERROR, 3000)
             has_speech = False
         # Handle frame data.
         if has_speech:
-            # Branch: Chunk contains speech
-            self.consecutive_speech_chunks += 1
-            if not self.in_speech:
-                # Sub-branch: Not currently in a speech segment
-                # Check if we have enough consecutive speech chunks to start a segment
-                if self.consecutive_speech_chunks >= self.min_speech_chunks:
-                    # Start a new speech segment
-                    self.in_speech = True
-                    self.current_segment_chunks = []
-                    self.silence_duration = 0.0
-                    self.speech_start_logged = False
-                    self.last_speech_time = None
-                    self.speech_start_time = chunk_start_time
-                    # Include current chunk in the segment
-                    self.current_segment_chunks.append(frame)
-            else:
-                # Sub-branch: Already in a speech segment
-                # Add chunk to current segment (includes all chunks, not just speech)
-                self.current_segment_chunks.append(frame)
-                self.silence_duration = 0.0
-                self.last_speech_time = chunk_start_time
-                # Log "speech started" message after 0.3s delay to avoid logging on every chunk
-                if not self.speech_start_logged and self.speech_start_time is not None:
-                    time_since_speech_start = chunk_start_time - self.speech_start_time
-                    if time_since_speech_start >= 0.3:
-                        logger.info(f"[SAD] {self.speech_start_time:.3f} speech started")
-                        self.speech_start_logged = True
-        else:
-            # Branch: Chunk does not contain speech
-            self.consecutive_speech_chunks = 0
             if self.in_speech:
-                # Sub-branch: Currently in a speech segment
-                # Add chunk to segment (include non-speech chunks too)
-                self.current_segment_chunks.append(frame)
-                self.silence_duration += chunk_duration
-                # Early abort: If segment just started (< 1.0s) and we get 0.2s of silence,
-                # abort the segment to avoid false positives
+                # Just add new chunk to the current speech segment.
+                self.speech_segment_chunks.append(frame)
+                self.speech_end_time = frame_start_time + frame_duration
+            else:
+                segment_length = len(self.speech_segment_chunks)
+                # Check it is the first speech chunk.
+                if segment_length == 0:
+                    self.speech_start_time = frame_start_time
+                # Check if we have enough consecutive speech chunks to officially start a segment.
+                if segment_length >= self.vad_min_speech_chunks:
+                    self.in_speech = True
+                    # Log "speech detected" as soon as we're sure speech is active.
+                    if segment_length == self.vad_min_speech_chunks and self.speech_start_time is not None:
+                        logger.info(f"[SAD] {frame_start_time:.3f} speech detected (started {frame_start_time - self.speech_start_time:.3f} seconds ago)")
+            # Always add the frame to the current speech segment.
+            self.speech_segment_chunks.append(frame)
+        else:  # This frame does not contain speech.
+            if self.in_speech:
+                self.speech_silence_duration += frame_duration
+                if self.speech_end_time == 0.0:
+                    self.speech_end_time = frame_start_time
+                # Check duration of a silence is not long enough to finalize the segment.
+                if self.speech_silence_duration < self.vad_silence_threshold_seconds:
+                    self.speech_segment_chunks.append(frame)
+                    return
+                # Otherwise finalize the segment.
+                # Check state variables.
+                if self.speech_start_time is None:
+                    self.notify("Error", "Speech start time is not set", logging.ERROR, 2000)
+                    return
+                # Concatenate all chunks (speech + non-speech at the end) into a single segment.
+                segment: np.ndarray = np.concatenate(self.speech_segment_chunks)
+                segment_duration = len(segment) / float(self.vad_sample_rate)
+                logger.info(f"[SAD] {frame_start_time:.3f} speech finished ({self.speech_end_time:.3f}s ago), handling chunk of {segment_duration:.3f} seconds audio")
+                # Send complete segment to transcription queue
+                self.transcription_queue.put(segment)
+                if not self.file_mode and self.config.get("save_recordings", False):
+                    self.file_saving_queue.put((segment, self.vad_sample_rate))
+                self._reset_speech_mode()
+            elif len(self.speech_segment_chunks) > 0:
+                # Reset speech mode.
+                self._reset_speech_mode()
+
+    def _finalize_segment(self):
+        """Force finalize remaining speech segment."""
+        if self.in_speech and self.speech_segment_chunks:
+            # Finish segment forcefully.
+            segment = np.concatenate(self.speech_segment_chunks)
+            segment_audio_duration = len(segment) / float(self.vad_sample_rate)
+            current_in_segment_time = self.speech_end_time
+            # Calculate current in segment time.
+            if current_in_segment_time <= 0.0:
                 if self.speech_start_time is not None:
-                    time_since_speech_start = chunk_start_time - self.speech_start_time
-                    if time_since_speech_start < 1.0 and self.silence_duration >= 0.2:
-                        self.in_speech = False
-                        self.current_segment_chunks = []
-                        self.silence_duration = 0.0
-                        self.speech_start_time = None
-                        self.speech_start_logged = False
-                        self.last_speech_time = None
-                        return
-                # Check if silence duration exceeds threshold - time to finalize segment
-                if self.silence_duration >= self.vad_silence_threshold_seconds:
-                    if self.current_segment_chunks:
-                        # Concatenate all chunks (speech + non-speech) into a single segment
-                        segment: np.ndarray = np.concatenate(self.current_segment_chunks)
-                        segment_audio_duration = len(segment) / float(self.vad_sample_rate)
-                        speech_end_time = self.last_speech_time if self.last_speech_time is not None else chunk_start_time
-                        segment_time_span = speech_end_time - self.speech_start_time if self.speech_start_time is not None else segment_audio_duration
-                        min_segment_duration = 0.5
-                        # Only send segments that meet minimum duration requirement
-                        if segment_audio_duration >= min_segment_duration:
-                            if self.speech_start_time is not None:
-                                logger.info(f"[SAD] {speech_end_time:.3f} speech finished, handling chunk of {segment_audio_duration:.3f} seconds audio (span: {segment_time_span:.3f}s)")
-                            # Send complete segment (all chunks) to transcription queue
-                            self.transcription_queue.put(segment)
-                            if not self.file_mode and self.config.get("save_recordings", False):
-                                self.file_saving_queue.put((segment, self.vad_sample_rate))
-                        else:
-                            logger.debug(f"[SAD] Dropping segment too short ({segment_audio_duration:.3f}s < {min_segment_duration}s)")
-                    # Reset segment state
-                    self.in_speech = False
-                    self.current_segment_chunks = []
-                    self.silence_duration = 0.0
-                    self.speech_start_time = None
-                    self.last_speech_time = None
+                    current_in_segment_time = self.speech_start_time + segment_audio_duration
+                else:
+                    current_in_segment_time = segment_audio_duration
+            # Log finalization.
+            logger.info(f"[SAD] {current_in_segment_time:.3f} speech finished (forced), handling chunk of {segment_audio_duration:.3f} seconds audio")
+            # Send complete segment to transcription queue.
+            self.transcription_queue.put(segment)
+            # Save segment to file if needed.
+            if not self.file_mode and self.config.get("save_recordings", False):
+                self.file_saving_queue.put((segment, self.vad_sample_rate))
+            self._reset_speech_mode()
 
     def _transcription_worker(self):
         """Transcription worker thread - processes chunks in order."""
@@ -720,13 +742,21 @@ class StreamingDictation(Dictation):
                 if self.model is None:
                     logger.error("[transcriber] Model not loaded")
                     continue
+                # Convert int16 to float32 and normalize to [-1.0, 1.0]
+                if segment.dtype == np.int16:
+                    segment = segment.astype(np.float32) / 32768.0
                 trans_start = time.time()
                 segments, info = self.model.transcribe(
                     segment,
-                    beam_size=5,
-                    vad_filter=False,
-                    temperature=0.0,
+                    # FYI: don't disable vad_filter, it will cause errors like
+                    # "No speech threshold is met (0.620832 > 0.600000)"
+                    # if we detected speech incorrectly or cutted with big gaps inside.
+                    vad_filter=True,
+                    # FYI: don't set temperature=0.0, it will cause errors like
+                    # "Log probability threshold is not met with temperature 0.0 (-1.359611 < -1.000000)"
+                    # temperature=0.0, 
                     language="en",
+                    condition_on_previous_text=True,
                     without_timestamps=True,
                 )
                 trans_duration = time.time() - trans_start
@@ -751,8 +781,7 @@ class StreamingDictation(Dictation):
         """Typing worker thread - types text in order of chunks."""
         while self.recording or not self.typing_queue.empty():
             if not self.typer:
-                logger.error("[typer] Typer is not initialized")
-                self.notify("Error", "Typer is not initialized", "dialog-error", 3000)
+                self.notify("Error", "Typer is not initialized", logging.ERROR, 3000)
                 return
             try:
                 typing_task = self.typing_queue.get(timeout=0.1)
@@ -761,6 +790,9 @@ class StreamingDictation(Dictation):
                     break
                 # Get typing task and log it.
                 text_to_type, chunk_idx = typing_task
+                # Add space before chunk if it's not the first one
+                if chunk_idx > 1:
+                    text_to_type = " " + text_to_type
                 logger.info(f"[typer] Chunk {chunk_idx} typing: {text_to_type}")
                 # Run typing.
                 try:
@@ -787,7 +819,7 @@ class StreamingDictation(Dictation):
                         wf.setnchannels(1)
                         wf.setsampwidth(2)
                         wf.setframerate(sample_rate)
-                        wf.writeframes((segment * 32768.0).astype(np.int16).tobytes())
+                        wf.writeframes(segment.tobytes())
                 except Exception as e:
                     logger.error(f"[record] Failed to save streaming chunk: {e}", exc_info=True)
             except queue.Empty:
@@ -801,8 +833,7 @@ class StreamingDictation(Dictation):
         self.recording = False
         self.stopping = True
         # Notify about stopping.
-        logger.info("[idle] Recording stopped, transcribing remaining chunks...")
-        self.notify("Transcribing stopped", "Processing remaining chunks", "emblem-synchronizing", 1500)
+        self.notify("Transcribing stopped", "Processing remaining chunks", logging.INFO, 1500, "emblem-synchronizing")
         if self.audio_thread:
             self.audio_thread.join(timeout=2.0)
         if self.audio_stream:
@@ -843,13 +874,13 @@ class StreamingDictation(Dictation):
                 process.communicate(input=final_text.encode())
                 logger.info(f"[idle] Pasted to clipboard: {final_text}")
             logger.info(f"[idle] Final text: {final_text}")
-            self.notify("Got:", final_text[:100] + ("..." if len(final_text) > 100 else ""), "emblem-ok-symbolic", 3000)
+            self.notify("Got:", final_text[:100] + ("..." if len(final_text) > 100 else ""), logging.INFO, 3000)
         else:
             logger.info("[idle] No speech detected")
             if not self._device_help_shown:
                 self._show_device_help()
             else:
-                self.notify("No speech detected", "Try speaking louder or check audio device", "dialog-warning", 2000)
+                self.notify("No speech detected", "Try speaking louder or check audio device", logging.WARNING, 2000)
 
     def transcribe_file(self, wav_file_path: str) -> str:
         """
@@ -870,7 +901,7 @@ class StreamingDictation(Dictation):
             with wave.open(wav_file_path, "rb") as wf:
                 n_frames = wf.getnframes()
                 audio_data = wf.readframes(n_frames)
-                audio_buffer = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_buffer = np.frombuffer(audio_data, dtype=np.int16)
         except Exception as e:
             raise RuntimeError(f"Failed to read WAV file: {e}")
         # Process audio in chunks similar to streaming mode.
@@ -888,7 +919,7 @@ class StreamingDictation(Dictation):
                 chunk = audio_buffer[i:i + frames_per_buffer]
                 if len(chunk) < frames_per_buffer:
                     chunk = np.pad(chunk, (0, frames_per_buffer - len(chunk)), mode='constant')
-                self._process_audio_chunk(chunk, chunk_duration)
+                self._process_audio_chunk(chunk, i / float(self.vad_sample_rate), chunk_duration)
             # Finalize any remaining speech segment.
             self._finalize_segment()
             # Signal transcription worker to stop.
@@ -917,37 +948,20 @@ class StreamingDictation(Dictation):
 def check_dependencies(config: dict):
     """Check that required system commands are available."""
     missing = []
-
-    required_cmds = ["arecord"]
+    # System command dependencies.
+    required_cmds = []
     if config["clipboard"]:
         required_cmds.append("xclip")
-
+    if config["auto_type"]:
+        required_cmds.append("xdotool")
     for cmd in required_cmds:
         if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-            pkg = "alsa-utils" if cmd == "arecord" else cmd
-            missing.append((cmd, pkg))
-
-    if config["auto_type"]:
-        if subprocess.run(["which", "xdotool"], capture_output=True).returncode != 0:
-            missing.append(("xdotool", "xdotool"))
-
-    # Python module dependencies
-    try:
-        import webrtcvad  # type: ignore
-    except ImportError:
-        logger.error("Python dependency missing: webrtcvad (install with: pip install webrtcvad)")
-        sys.exit(1)
-    if config.get("default_streaming", False):
-        try:
-            import pyaudio  # type: ignore
-        except ImportError:
-            logger.error("Python dependency missing: pyaudio (install with: pip install pyaudio)")
-            sys.exit(1)
-
+            missing.append((cmd, cmd))
+    # Check for missing dependencies.
     if missing:
         logger.error("Missing dependencies:")
         for cmd, pkg in missing:
-            logger.error(f"  {cmd} - install with: sudo apt install {pkg}")
+            logger.error(f"  {cmd} - install with something like: sudo apt install {pkg}")
         sys.exit(1)
 
 

@@ -30,6 +30,20 @@ run-stream-verbose:
 		exit 1; \
 	fi
 
+run-file:
+	@if [ -z "$$F" ]; then \
+		echo "Usage: make run-file F=<path/to/your_file.wav>"; \
+		exit 1; \
+	fi; \
+	if command -v uv >/dev/null 2>&1; then \
+		uv run python dictate.py --file "$$F"; \
+	elif command -v poetry >/dev/null 2>&1; then \
+		poetry run python dictate.py --file "$$F"; \
+	else \
+		echo "Error: Neither uv nor poetry found. Please install one of them."; \
+		exit 1; \
+	fi
+
 run-no-stream:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run python dictate.py --no-streaming; \

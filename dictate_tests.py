@@ -134,23 +134,13 @@ def mock_whisper_model(monkeypatch):
 
 
 @pytest.fixture
-def mock_arecord(monkeypatch):
-    """Mock arecord subprocess."""
-    mock_process = MagicMock()
-    mock_process.poll.return_value = None
-    mock_process.stdout = BytesIO()
-    mock_process.wait.return_value = 0
-    mock_process.terminate = MagicMock()
-    
-    def mock_popen(cmd, **kwargs):
-        if "arecord" in cmd:
-            return mock_process
-        return MagicMock()
-    
-    monkeypatch.setattr(dictate.subprocess, "Popen", mock_popen)
-    monkeypatch.setattr(dictate.subprocess, "run", MagicMock(return_value=MagicMock(returncode=0)))
-    
-    return mock_process
+def mock_pyaudio_stream(monkeypatch):
+    """Mock pyaudio stream."""
+    mock_stream = MagicMock()
+    mock_stream.read.return_value = b'\x00' * 3200
+    mock_stream.stop_stream = MagicMock()
+    mock_stream.close = MagicMock()
+    return mock_stream
 
 
 @pytest.fixture
@@ -163,7 +153,7 @@ def mock_xdotool(monkeypatch):
     def mock_run_with_which(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "which":
             result = MagicMock()
-            if len(cmd) > 1 and cmd[1] in ["xdotool", "arecord", "xclip"]:
+            if len(cmd) > 1 and cmd[1] in ["xdotool", "xclip"]:
                 result.returncode = 0
             else:
                 result.returncode = 1
@@ -227,10 +217,22 @@ class TestStreamingDictation:
 class TestDictation:
     """Tests for non-streaming Dictation class (backward compatibility)."""
     
+    @patch('dictate.pyaudio.PyAudio')
     @patch('dictate.subprocess.run')
     @patch('dictate.subprocess.Popen')
-    def test_non_streaming_mode(self, mock_popen, mock_run, mock_config, mock_whisper_model):
+    def test_non_streaming_mode(self, mock_popen, mock_run, mock_pyaudio, mock_config, mock_whisper_model):
         """Test non-streaming mode (backward compatibility)."""
+        # Mock PyAudio
+        mock_audio_instance = MagicMock()
+        mock_audio_stream = MagicMock()
+        mock_audio_stream.read.return_value = b'\x00' * 3200
+        mock_audio_stream.stop_stream = MagicMock()
+        mock_audio_stream.close = MagicMock()
+        mock_audio_instance.open.return_value = mock_audio_stream
+        mock_audio_instance.get_device_count.return_value = 1
+        mock_audio_instance.get_default_input_device_info.return_value = {'index': 0, 'name': 'test device'}
+        mock_pyaudio.return_value = mock_audio_instance
+        
         # Ensure non-streaming mode
         config = dictate.load_config()
         config["default_streaming"] = False
@@ -270,15 +272,27 @@ class TestDictation:
 class TestClipboardIntegration:
     """Tests specifically for the clipboard parameter integration."""
 
+    @patch('dictate.pyaudio.PyAudio')
     @patch('dictate.subprocess.run')
     @patch('dictate.subprocess.Popen')
-    def test_dictation_no_clipboard_call(self, mock_popen, mock_run, mock_config, mock_whisper_model):
+    def test_dictation_no_clipboard_call(self, mock_popen, mock_run, mock_pyaudio, mock_config, mock_whisper_model):
         """Test that Dictation doesn't call xclip when clipboard is disabled."""
+        # Mock PyAudio
+        mock_audio_instance = MagicMock()
+        mock_audio_stream = MagicMock()
+        mock_audio_stream.read.return_value = b'\x00' * 3200
+        mock_audio_stream.stop_stream = MagicMock()
+        mock_audio_stream.close = MagicMock()
+        mock_audio_instance.open.return_value = mock_audio_stream
+        mock_audio_instance.get_device_count.return_value = 1
+        mock_audio_instance.get_default_input_device_info.return_value = {'index': 0, 'name': 'test device'}
+        mock_pyaudio.return_value = mock_audio_instance
+        
         # Mock subprocess.run for Typer initialization
         def mock_run_side_effect(cmd, **kwargs):
             result = MagicMock()
             if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "which":
-                if len(cmd) > 1 and cmd[1] in ["xdotool", "arecord", "xclip"]:
+                if len(cmd) > 1 and cmd[1] in ["xdotool", "xclip"]:
                     result.returncode = 0
                 else:
                     result.returncode = 1
@@ -295,9 +309,8 @@ class TestClipboardIntegration:
         dictation = dictate.Dictation(config)
         dictation.model_loaded.wait(timeout=1.0)
         
-        # Mock a recorded file
-        dictation.temp_file = MagicMock()
-        dictation.temp_file.name = "test.wav"
+        # Mock audio data
+        dictation.audio_data = [np.array([0] * 1600, dtype=np.int16)]
         dictation.recording = True
         
         # Mock model return
@@ -320,13 +333,13 @@ class TestClipboardIntegration:
     @patch('dictate.subprocess.run')
     @patch('dictate.subprocess.Popen')
     @patch('dictate.pyaudio.PyAudio')
-    def test_streaming_dictation_no_clipboard_call(self, mock_pyaudio, mock_popen, mock_run, mock_config, mock_whisper_model, mock_arecord):
+    def test_streaming_dictation_no_clipboard_call(self, mock_pyaudio, mock_popen, mock_run, mock_config, mock_whisper_model):
         """Test that StreamingDictation doesn't call xclip when clipboard is disabled."""
         # Mock subprocess.run for Typer initialization
         def mock_run_side_effect(cmd, **kwargs):
             result = MagicMock()
             if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "which":
-                if len(cmd) > 1 and cmd[1] in ["xdotool", "arecord", "xclip"]:
+                if len(cmd) > 1 and cmd[1] in ["xdotool", "xclip"]:
                     result.returncode = 0
                 else:
                     result.returncode = 1
@@ -385,7 +398,7 @@ class TestClipboardIntegration:
         """Test that xclip is optional in check_dependencies if clipboard is disabled."""
         mock_run = MagicMock()
         
-        # Mock 'which' to return 0 for arecord, but 1 for xclip
+        # Mock 'which' to return 1 for xclip (missing)
         def side_effect(cmd, **kwargs):
             res = MagicMock()
             if isinstance(cmd, list) and len(cmd) > 1 and cmd[1] == "xclip":
@@ -397,7 +410,7 @@ class TestClipboardIntegration:
         mock_run.side_effect = side_effect
         monkeypatch.setattr(dictate.subprocess, "run", mock_run)
         
-        # Should NOT exit if clipboard is False (webrtcvad is already imported, so import check passes)
+        # Should NOT exit if clipboard is False (webrtcvad and pyaudio are already imported, so import check passes)
         dictate.check_dependencies({"clipboard": False, "auto_type": False, "default_streaming": False})
         
         # Should exit if clipboard is True (since xclip is missing)
