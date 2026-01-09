@@ -203,3 +203,11 @@ uv run pytest dictate_tests.py
 make test
 ```
 
+# TODO/Roadmap
+
+- [ ] Migrate everything to PyAudio.
+- [ ] Fix issue with skipping the first word.
+- [ ] Fix issue with not pasting final text to input field.
+- [ ] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
+- [ ] Add context with the first word. E.g. "Python" at the start appends `initial_prompt` (or `prefix`) parameter to "Speech about task in Python programming language".
+- [ ] Add ability to tune `model.transcribe()` parameters via config.

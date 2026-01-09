@@ -14,8 +14,7 @@ import wave
 import logging
 from pathlib import Path
 from typing import Optional, Iterable, Tuple
-from concurrent.futures import ThreadPoolExecutor
-from faster_whisper.transcribe import Segment, Word
+from faster_whisper.transcribe import Segment
 
 import numpy as np
 import pyaudio
@@ -64,7 +63,7 @@ def load_config():
     }
 
 
-def get_hotkey(key_name):
+def get_hotkey(key_name: str) -> keyboard.KeyCode:
     """Map key name to pynput key."""
     key_name = key_name.lower()
     if hasattr(keyboard.Key, key_name):
@@ -138,7 +137,7 @@ class Dictation:
         logger.debug(f"Loading Whisper model ({config['model']})...")
         threading.Thread(target=self._load_model, daemon=True).start()
 
-    def get_hotkey_name(self):
+    def get_hotkey_name(self) -> str:
         return getattr(self.hotkey, 'name', None) or getattr(self.hotkey, 'char', DEFAULT_HOTKEY)
 
     def _load_model(self):
@@ -726,6 +725,9 @@ class StreamingDictation(Dictation):
                     segment,
                     beam_size=5,
                     vad_filter=False,
+                    temperature=0.0,
+                    language="en",
+                    without_timestamps=True,
                 )
                 trans_duration = time.time() - trans_start
                 text = self._segments_to_text(segments, False)
@@ -1000,18 +1002,18 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
     parser.add_argument(
         "--no-streaming",
         action="store_true",
-        help="Disable streaming transcription mode (force non-streaming)"
+        help="Disable streaming transcription mode (default: from config)"
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Verbose output"
+        help="Verbose output to troubleshoot"
     )
     parser.add_argument(
         "--file",
         type=str,
         metavar="WAV_FILE",
-        help="Transcribe a WAV file and exit (uses streaming or non-streaming mode based on settings)"
+        help="Transcribe provided WAV file and exit"
     )
     args = parser.parse_args()
     check_dependencies(config)
