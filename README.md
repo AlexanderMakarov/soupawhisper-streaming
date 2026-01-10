@@ -230,8 +230,8 @@ make test
 
 - [x] Migrate everything to PyAudio.
 - [x] Fix issue with skipping the first word.
-- [ ] Fix issue with not pasting final text to input field.
-- [ ] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
+- [x] Fix issue with not pasting final text to input field.
+- [x] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
 - [ ] Add setting to keep context of the previous transcription. E.g. use previous transcription as `initial_prompt` parameter.
 - [ ] Add context with the first word. E.g. "Python" word at the start turns `initial_prompt` parameter to "Speech about task in Python programming language".
 - [ ] Set language with the first word.

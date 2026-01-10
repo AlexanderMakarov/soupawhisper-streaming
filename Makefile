@@ -1,4 +1,4 @@
-.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record
+.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record service-reinstall
 
 run:
 	@if command -v uv >/dev/null 2>&1; then \
@@ -98,3 +98,6 @@ record:
 		echo "Error: arecord not found. Please install alsa-utils."; \
 		exit 1; \
 	fi
+
+service-reinstall:
+	@./install.sh --skip-deps --install-service

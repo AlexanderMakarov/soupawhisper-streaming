@@ -133,7 +133,6 @@ class Dictation:
         self.audio_data: list[np.ndarray] = []
         self.sample_rate = 16000
         self.frames_per_buffer = 4096  # ~0.25 seconds of audio
-        self._device_help_shown = False
 
         if self.config["auto_type"]:
             self.typer = Typer(
@@ -212,20 +211,46 @@ class Dictation:
                 pass
         return devices
 
-    def _show_device_help(self):
-        """Show available audio devices and instructions when no audio is detected."""
-        if self._device_help_shown:
-            return
-        self._device_help_shown = True
-        logger.error("[record] No audio detected. Building list of devices...")
+    def _report_audio_problem(self, issue_description: str = "No audio detected"):
+        """Show available audio devices and instructions when no audio is detected.
+        
+        Args:
+            issue_description: Description of the audio input issue (e.g., "Audio input contains only zeros" or "Audio input has too low amplitude")
+        """
+        logger.error(f"[record] {issue_description}. Building list of devices...")
         devices = self._get_available_input_devices()
         devices_list = [f"  {i}: {name}" for i, name, _ in devices]
         devices_text = "\n".join(devices_list[:8])
         if len(devices_list) > 8:
             devices_text += f"\n  ... and {len(devices_list) - 8} more"
         config_path = CONFIG_PATH
-        message = f"Set 'audio_input_device' in {config_path}\nSupported (by pyaudio, not on this machine!) devices:\n{devices_text}"
+        message = f"{issue_description}\n\nSet 'audio_input_device' in {config_path}\nSupported (by pyaudio, not on this machine!) devices:\n{devices_text}"
         self.notify("No audio detected - check device", message, logging.WARNING, 10000)
+
+    def _check_valid_audio_input(self, audio_buffer: np.ndarray) -> bool:
+        """
+        Check if audio segment contains only zeros or is effectively silent.
+        If detected, logs error and shows device help.
+        This indicates an audio input problem, not just absence of speech.
+
+        Args:
+            audio_buffer: Audio array (int16 format).
+
+        Returns:
+            True if segment is all zeros or has very low amplitude (audio input problem)
+        """
+        if audio_buffer.dtype == np.int16:
+            # Check if all zeros
+            if np.all(audio_buffer == 0):
+                self._report_audio_problem("Audio input contains only zeros")
+                return True
+            # Check max amplitude - if very small, likely no audio input
+            # For int16, normal speech would have max amplitude > 100
+            max_amplitude = np.max(np.abs(audio_buffer))
+            if max_amplitude < 100:
+                self._report_audio_problem("Audio input is effectively silent (too low amplitude)")
+                return True
+        return False
 
     def _start_pyaudio_stream(self, frames_per_buffer: int) -> Optional[pyaudio.Stream]:
         """
@@ -265,8 +290,6 @@ class Dictation:
 
     def notify(self, title, message, level=logging.INFO, timeout=2000, icon=None):
         """Send a desktop notification."""
-        if not self.config["notifications"]:
-            return
         icon_map = {
             logging.DEBUG: "dialog-information",
             logging.INFO: "dialog-information",
@@ -284,7 +307,9 @@ class Dictation:
             logging.CRITICAL: logger.critical,
         }
         log_method = log_method_map.get(level, logger.info)
-        log_method("[idle] Showing notification: %s, %s, %s, %s", title, message, icon, timeout)
+        log_method("Showing notification: %s, %s, %s, %s", title, message, icon, timeout)
+        if not self.config["notifications"]:
+            return
         subprocess.run(
             [
                 "notify-send",
@@ -388,7 +413,6 @@ class Dictation:
 
         self.recording = True
         self.audio_data = []
-        self._device_help_shown = False
 
         self.audio_stream = self._start_pyaudio_stream(self.frames_per_buffer)
         if self.audio_stream is None:
@@ -424,12 +448,13 @@ class Dictation:
 
         try:
             if not self.audio_data:
-                logger.error("Cannot transcribe: no audio data recorded")
-                if not self._device_help_shown:
-                    self._show_device_help()
+                self._report_audio_problem("No audio data recorded")
                 return
 
             audio_array = np.concatenate(self.audio_data)
+            # Check if audio contains only zeros or is effectively silent (audio input problem)
+            if self._check_valid_audio_input(audio_array):
+                return
             if self.config.get("save_recordings", False):
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 file_path = os.path.join(tempfile.gettempdir(), f"recording_{timestamp}.wav")
@@ -464,11 +489,7 @@ class Dictation:
                         "emblem-ok-symbolic",
                     )
             else:
-                logger.info("No speech detected")
-                if not self._device_help_shown:
-                    self._show_device_help()
-                else:
-                    self.notify("No speech detected", "Check your microphone or try speaking louder", logging.WARNING, 2000)
+                self.notify("No speech detected", "Check your microphone or try speaking louder", logging.WARNING, 2000, "audio-input-microphone")
         except Exception as e:
             logger.error(f"Error transcribing: {e}", exc_info=True)
             self.notify("Error", str(e)[:50], logging.ERROR, 3000)
@@ -550,7 +571,6 @@ class StreamingDictation(Dictation):
         self.speech_silence_duration: float = 0.0
         self.speech_end_time: float = 0.0
         self.accumulated_text = ""
-        self._device_help_shown = False
 
     def _finish_model_loading(self):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
@@ -584,7 +604,6 @@ class StreamingDictation(Dictation):
         self.accumulated_text = ""
         self.in_speech = False
         self.speech_segment_chunks = []
-        self._device_help_shown = False
         self.speech_start_time = None
         # Clear queues to remove any leftover sentinels from previous recording
         while not self.transcription_queue.empty():
@@ -734,13 +753,17 @@ class StreamingDictation(Dictation):
     def _transcription_worker(self):
         """Transcription worker thread - processes chunks in order."""
         chunk_idx = 0
-        while self.recording or not self.transcription_queue.empty():
+        # FYI: continue during "stopping" state to process all remaining items before exiting.
+        while self.recording or self.stopping or not self.transcription_queue.empty():
             try:
                 segment: np.ndarray | None = self.transcription_queue.get(timeout=0.1)
                 if segment is None:
                     break
                 if self.model is None:
                     logger.error("[transcriber] Model not loaded")
+                    continue
+                # Check if segment is all zeros or effectively silent (audio input problem)
+                if self._check_valid_audio_input(segment):
                     continue
                 # Convert int16 to float32 and normalize to [-1.0, 1.0]
                 if segment.dtype == np.int16:
@@ -763,11 +786,12 @@ class StreamingDictation(Dictation):
                 text = self._segments_to_text(segments, False)
                 if not text:
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
-                    if not self._device_help_shown:
-                        self._show_device_help()
                     continue
                 else:
                     logger.info(f"[transcriber] Transcribed {len(segment) / float(self.vad_sample_rate):.2f}s in {trans_duration:.2f}s: {text}")
+                # Add space before chunk if it's not the first one
+                if chunk_idx > 0:
+                    text = " " + text
                 self.accumulated_text += text
                 chunk_idx += 1
                 if not self.file_mode and self.typing_queue:
@@ -779,7 +803,8 @@ class StreamingDictation(Dictation):
 
     def _typing_worker(self):
         """Typing worker thread - types text in order of chunks."""
-        while self.recording or not self.typing_queue.empty():
+        # FYI: continue during "stopping" state to process all remaining items before exiting.
+        while self.recording or self.stopping or not self.typing_queue.empty():
             if not self.typer:
                 self.notify("Error", "Typer is not initialized", logging.ERROR, 3000)
                 return
@@ -790,9 +815,6 @@ class StreamingDictation(Dictation):
                     break
                 # Get typing task and log it.
                 text_to_type, chunk_idx = typing_task
-                # Add space before chunk if it's not the first one
-                if chunk_idx > 1:
-                    text_to_type = " " + text_to_type
                 logger.info(f"[typer] Chunk {chunk_idx} typing: {text_to_type}")
                 # Run typing.
                 try:
@@ -806,7 +828,8 @@ class StreamingDictation(Dictation):
 
     def _file_saving_worker(self):
         """File saving worker thread - saves audio segments to files asynchronously."""
-        while self.recording or not self.file_saving_queue.empty():
+        # FYI: continue during "stopping" state to process all remaining items before exiting.
+        while self.recording or self.stopping or not self.file_saving_queue.empty():
             try:
                 task = self.file_saving_queue.get(timeout=0.1)
                 if task is None:
@@ -849,15 +872,18 @@ class StreamingDictation(Dictation):
             except Exception:
                 pass
             self.audio_interface = None
-        # Signal workers to stop (they will process all remaining items before exiting).
+        # Signal transcription worker to stop.
         self.transcription_queue.put(None)
-        if not self.file_mode and self.config["auto_type"]:
-            self.typing_queue.put(None)
         if self.config.get("save_recordings", False):
             self.file_saving_queue.put(None)
-        # Join worker threads.
+        # Wait for transcription worker to finish processing all segments
+        # (including the last one that might be in progress).
         if self.transcription_thread:
             self.transcription_thread.join(timeout=5.0)
+        # Now that transcription is done, signal typing worker to stop.
+        if not self.file_mode and self.config["auto_type"]:
+            self.typing_queue.put(None)
+        # Join remaining worker threads.
         if self.typing_thread:
             self.typing_thread.join(timeout=1.0)
         if self.file_saving_thread:
@@ -877,10 +903,7 @@ class StreamingDictation(Dictation):
             self.notify("Got:", final_text[:100] + ("..." if len(final_text) > 100 else ""), logging.INFO, 3000)
         else:
             logger.info("[idle] No speech detected")
-            if not self._device_help_shown:
-                self._show_device_help()
-            else:
-                self.notify("No speech detected", "Try speaking louder or check audio device", logging.WARNING, 2000)
+            self.notify("No speech detected", "Try speaking louder or check audio device", logging.WARNING, 2000)
 
     def transcribe_file(self, wav_file_path: str) -> str:
         """

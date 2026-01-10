@@ -4,16 +4,9 @@ Tests for SoupaWhisper dictate.py
 """
 
 import pytest
-import tempfile
-import threading
-import time
-import wave
 import numpy as np
-import shutil
 import queue
-from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch, mock_open
-from io import BytesIO
+from unittest.mock import MagicMock, patch
 from typing import Any
 
 # Add 2 second timeout to all tests to prevent infinite loops
@@ -121,15 +114,15 @@ vad_threshold = 0.5
 def mock_whisper_model(monkeypatch):
     """Mock WhisperModel."""
     model = MockWhisperModel()
-    
+
     def mock_init(model_name, device="cpu", compute_type="int8"):
         model.model_name = model_name
         model.device = device
         model.compute_type = compute_type
         return model
-    
+
     monkeypatch.setattr(dictate.WhisperModel, "__new__", lambda cls, *args, **kwargs: mock_init(*args, **kwargs))
-    
+
     return model
 
 

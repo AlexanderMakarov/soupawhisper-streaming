@@ -156,6 +156,15 @@ EOF
     systemctl --user daemon-reload
     systemctl --user enable soupawhisper
 
+    # Restart if running, otherwise start
+    if systemctl --user is-active --quiet soupawhisper 2>/dev/null; then
+        echo "Restarting service..."
+        systemctl --user restart soupawhisper
+    else
+        echo "Starting service..."
+        systemctl --user start soupawhisper || echo "Service start failed (may need manual start)"
+    fi
+
     echo ""
     echo "Service installed! Commands:"
     echo "  systemctl --user start soupawhisper   # Start"
@@ -166,21 +175,61 @@ EOF
 
 # Main
 main() {
+    local SKIP_DEPS=false
+    local INSTALL_SERVICE=false
+
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --skip-deps|--no-deps)
+                SKIP_DEPS=true
+                shift
+                ;;
+            --install-service|--service)
+                INSTALL_SERVICE=true
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: $0 [--skip-deps] [--install-service]"
+                echo ""
+                echo "Options:"
+                echo "  --skip-deps, --no-deps        Skip installation of OS dependencies (requires sudo)"
+                echo "  --install-service, --service   Automatically install systemd service without prompting"
+                echo "  -h, --help                    Show this help message"
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Use -h or --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+
     echo "==================================="
     echo "  SoupaWhisper Installer"
     echo "==================================="
     echo ""
 
-    install_deps
+    if [ "$SKIP_DEPS" = false ]; then
+        install_deps
+    else
+        echo "Skipping OS dependencies installation (--skip-deps flag provided)"
+    fi
+
     install_python
     setup_config
 
-    echo ""
-    read -p "Install as systemd service? [y/N] " -n 1 -r
-    echo ""
-
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [ "$INSTALL_SERVICE" = true ]; then
         install_service
+    else
+        echo ""
+        read -p "Install as systemd service? [y/N] " -n 1 -r
+        echo ""
+
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            install_service
+        fi
     fi
 
     echo ""
