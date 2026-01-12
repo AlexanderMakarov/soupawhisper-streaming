@@ -759,6 +759,10 @@ class StreamingDictation(Dictation):
             try:
                 segment: np.ndarray | None = self.transcription_queue.get(timeout=0.1)
                 if segment is None:
+                    # If we're stopping and there might be more segments, continue processing
+                    # This handles the race condition where None is added before the final segment
+                    if self.stopping and not self.transcription_queue.empty():
+                        continue
                     break
                 if self.model is None:
                     logger.error("[transcriber] Model not loaded")
@@ -883,7 +887,7 @@ class StreamingDictation(Dictation):
         # Wait for transcription worker to finish processing all segments
         # (including the last one that might be in progress).
         if self.transcription_thread:
-            self.transcription_thread.join(timeout=5.0)
+            self.transcription_thread.join(timeout=10.0)
         # Now that transcription is done, signal typing worker to stop.
         if not self.file_mode and self.config["auto_type"]:
             self.typing_queue.put(None)

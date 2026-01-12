@@ -229,7 +229,7 @@ make test
 - [x] Migrate everything to PyAudio.
 - [x] Fix issue with not pasting final text to input field.
 - [x] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
-- [ ] Fix issue with skipping the last segment. Repro on big models.
+- [x] Fix issue with skipping the last segment. Repro on big models.
 - [x] Fix wrong duration in `[transcriber] Transcribed 5.54s in 0.02s:` logs.
 - [ ] Add setting to keep context of the previous transcription. E.g. use previous transcription as `initial_prompt` parameter.
 - [ ] Add context with the first word. E.g. "Python" word at the start turns `initial_prompt` parameter to "Speech about task in Python programming language".
