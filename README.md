@@ -151,17 +151,14 @@ cp config.example.ini ~/.config/soupawhisper/config.ini
 Both streaming and non-streaming modes use PyAudio for audio recording. To configure which audio input device to use:
 
 1. **Find available devices**: Run the application with `--verbose` flag to see a list of available audio input devices in the logs.
-
 2. **Set device in config**: Edit `~/.config/soupawhisper/config.ini` and set the `audio_input_device` option in the `[streaming]` section:
-   ```ini
+  ```ini
    [streaming]
    audio_input_device = 0
-   ```
-   
+  ```
    You can specify either:
-   - A device index (integer, e.g., `0`, `8`)
-   - A partial device name (string, e.g., `"pulse"`, `"HDA Intel"`) - the first matching device will be used
-
+  - A device index (integer, e.g., `0`, `8`)
+  - A partial device name (string, e.g., `"pulse"`, `"HDA Intel"`) - the first matching device will be used
 3. **Default behavior**: If `audio_input_device` is not set or empty, PyAudio will use the system default input device.
 
 ## Troubleshooting
@@ -183,6 +180,7 @@ If no audio is detected, the application will show a notification with available
 - The `audio_input_device` setting in config matches your device index or name
 
 **Permission issues with keyboard:**
+
 ```bash
 sudo usermod -aG input $USER
 # Then log out and back in
@@ -196,13 +194,13 @@ Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
 
 ## Model Sizes
 
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| tiny.en  |   ~75MB | Fastest | Basic |
-| base.en  |  ~150MB | Fast    | Good |
-| small.en |  ~500MB | Medium  | Better |
-| medium.en | ~1.5GB | Slower  | Great |
-| large-v3 |    ~3GB | Slowest | Best |
+| Model     | Size   | Speed   | Accuracy |
+| --------- | ------ | ------- | -------- |
+| tiny.en   | ~75MB  | Fastest | Basic    |
+| base.en   | ~150MB | Fast    | Good     |
+| small.en  | ~500MB | Medium  | Better   |
+| medium.en | ~1.5GB | Slower  | Great    |
+| large-v3  | ~3GB   | Slowest | Best     |
 
 For dictation, `base.en` or `small.en` is usually the sweet spot.
 
@@ -229,9 +227,10 @@ make test
 # TODO/Roadmap
 
 - [x] Migrate everything to PyAudio.
-- [x] Fix issue with skipping the first word.
 - [x] Fix issue with not pasting final text to input field.
 - [x] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
+- [ ] Fix issue with skipping the last segment. Repro on big models.
+- [x] Fix wrong duration in `[transcriber] Transcribed 5.54s in 0.02s:` logs.
 - [ ] Add setting to keep context of the previous transcription. E.g. use previous transcription as `initial_prompt` parameter.
 - [ ] Add context with the first word. E.g. "Python" word at the start turns `initial_prompt` parameter to "Speech about task in Python programming language".
 - [ ] Set language with the first word.

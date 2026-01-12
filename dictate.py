@@ -467,10 +467,11 @@ class Dictation:
                     logger.info(f"[record] Saved recording to {file_path}")
                 except Exception as e:
                     logger.error(f"[record] Failed to save recording: {e}", exc_info=True)
-
+            trans_start = time.monotonic()
             text, duration = self._transcribe_audio_array(audio_array)
+            trans_duration = time.monotonic() - trans_start
             if text:
-                logger.info(f"Transcribed {duration:.2f}s: {text}")
+                logger.info(f"Transcribed {duration:.2f}s in {trans_duration:.2f}s: {text}")
                 if self.config["clipboard"]:
                     process = subprocess.Popen(
                         ["xclip", "-selection", "clipboard"],
@@ -768,7 +769,9 @@ class StreamingDictation(Dictation):
                 # Convert int16 to float32 and normalize to [-1.0, 1.0]
                 if segment.dtype == np.int16:
                     segment = segment.astype(np.float32) / 32768.0
-                trans_start = time.time()
+                # Use time.time() to match log timestamps (wall-clock time)
+                # Note: transcribe() returns an iterator, so actual work happens when we iterate
+                trans_start = time.monotonic()
                 segments, info = self.model.transcribe(
                     segment,
                     # FYI: don't disable vad_filter, it will cause errors like
@@ -782,8 +785,9 @@ class StreamingDictation(Dictation):
                     condition_on_previous_text=True,
                     without_timestamps=True,
                 )
-                trans_duration = time.time() - trans_start
+                # Consume the iterator to trigger actual transcription work.
                 text = self._segments_to_text(segments, False)
+                trans_duration = time.monotonic() - trans_start
                 if not text:
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
                     continue
