@@ -110,7 +110,8 @@ class Typer:
             )
         # Type the new text.
         subprocess.run(
-            ["xdotool", "type", "--delay", str(self.delay_ms), "--clearmodifiers", text],
+            # ["xdotool", "type", "--delay", str(self.delay_ms), "--clearmodifiers", text],
+            ["xdotool", "type", "--delay", str(self.delay_ms), text],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10
@@ -380,12 +381,16 @@ class Dictation:
     def stop(self):
         logger.info("\nExiting...")
         self.running = False
+        # Stop the keyboard listener to release X11 grabs
+        if hasattr(self, '_keyboard_listener') and self._keyboard_listener:
+            self._keyboard_listener.stop()
 
     def run(self):
         with keyboard.Listener(
             on_press=self.on_press,
             on_release=self.on_release,
         ) as listener:
+            self._keyboard_listener = listener
             listener.join()
 
     def _audio_recording_worker(self):
@@ -587,6 +592,7 @@ class StreamingDictation(Dictation):
         with keyboard.Listener(
             on_press=self.on_press
         ) as listener:
+            self._keyboard_listener = listener
             listener.join()
 
     def start_recording(self):
@@ -686,8 +692,6 @@ class StreamingDictation(Dictation):
         # Handle frame data.
         if has_speech:
             if self.in_speech:
-                # Just add new chunk to the current speech segment.
-                self.speech_segment_chunks.append(frame)
                 self.speech_end_time = frame_start_time + frame_duration
             else:
                 segment_length = len(self.speech_segment_chunks)
@@ -700,7 +704,7 @@ class StreamingDictation(Dictation):
                     # Log "speech detected" as soon as we're sure speech is active.
                     if segment_length == self.vad_min_speech_chunks and self.speech_start_time is not None:
                         logger.info(f"[SAD] {frame_start_time:.3f} speech detected (started {frame_start_time - self.speech_start_time:.3f} seconds ago)")
-            # Always add the frame to the current speech segment.
+            # Add the frame to the current speech segment exactly once.
             self.speech_segment_chunks.append(frame)
         else:  # This frame does not contain speech.
             if self.in_speech:
@@ -974,6 +978,9 @@ class StreamingDictation(Dictation):
         self.running = False
         if self.recording:
             self.stop_recording()
+        # Stop the keyboard listener to release X11 grabs
+        if hasattr(self, '_keyboard_listener') and self._keyboard_listener:
+            self._keyboard_listener.stop()
 
 
 def check_dependencies(config: dict):
@@ -1095,12 +1102,14 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
             logger.error(f"Failed to transcribe file: {e}", exc_info=True)
             sys.exit(1)
 
-    # Handle Ctrl+C gracefully
-    def handle_sigint(sig, frame):
+    # Handle Ctrl+C and SIGTERM gracefully
+    def handle_signal(sig, frame):
         dictation.stop()
-        os._exit(0)
+        # Use sys.exit() instead of os._exit() to allow cleanup
+        sys.exit(0)
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)  # For systemd stop
 
     # Start dictation.
     dictation.run()
