@@ -31,6 +31,9 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 
+[project.scripts]
+soupawhisper = "dictate:main"
+
 [tool.pytest.ini_options]
 python_files = ["*_test.py", "*_tests.py"]
 markers = [
