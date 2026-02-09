@@ -9,6 +9,7 @@ license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "setuptools<82",
     "faster-whisper>=1.0.0",
     "pynput>=1.7.6",
     "webrtcvad>=2.0.10",
