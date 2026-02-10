@@ -63,6 +63,23 @@ mkdir -p ~/.config/soupawhisper
 cp config.example.ini ~/.config/soupawhisper/config.ini
 ```
 
+### Language (English, Spanish, auto-detect)
+
+To force a language:
+
+```ini
+[whisper]
+language = en  # or: es
+```
+
+To transcribe multiple languages (for example English and Spanish), enable auto-detect and use a multilingual model (avoid `*.en` models):
+
+```ini
+[whisper]
+model = base
+language = auto
+```
+
 ### GPU support (optional)
 
 For NVIDIA GPU acceleration, install cuDNN 9 and set in `~/.config/soupawhisper/config.ini`:
@@ -219,6 +236,9 @@ For streaming dictation, `base.en` or `small.en` is usually the best tradeoff. B
 
 ---
 
+Note: `*.en` models (like `base.en`) are English-only and usually slightly better for English dictation.
+For multilingual dictation, use `base`, `small`, `medium`, or `large-v3` and set `language = auto`.
+
 ## Testing
 
 ```bash
@@ -242,5 +262,5 @@ uv run pytest dictate_tests.py
 - [ ] Support list of custom terms or pronunciation features (like accents or speech patterns).
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
-- [ ] Multiple languages support.
+- [x] Multiple languages support.
 - [ ] Expose more `model.transcribe()` options in config.

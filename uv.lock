@@ -732,6 +732,7 @@ dependencies = [
     { name = "faster-whisper" },
     { name = "pyaudio" },
     { name = "pynput" },
+    { name = "setuptools" },
     { name = "webrtcvad" },
 ]
 
@@ -748,6 +749,7 @@ requires-dist = [
     { name = "pynput", specifier = ">=1.7.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.0.0" },
+    { name = "setuptools", specifier = "<82" },
     { name = "webrtcvad", specifier = ">=2.0.10" },
 ]
 provides-extras = ["dev"]
