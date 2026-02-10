@@ -252,6 +252,16 @@ class TestDictation:
         assert isinstance(config["default_streaming"], bool)
         assert config["clipboard"] is True
 
+    def test_language_defaults_to_en(self, mock_config):
+        config = dictate.load_config()
+        assert config["language"] == "en"
+
+    def test_language_auto_maps_to_none(self, mock_config):
+        content = mock_config.read_text()
+        mock_config.write_text(content.replace("compute_type = int8", "compute_type = int8\nlanguage = auto"))
+        config = dictate.load_config()
+        assert config["language"] is None
+
     def test_config_clipboard_disabled(self, mock_config):
         """Test that clipboard=false is correctly loaded."""
         # Replace existing clipboard = true with clipboard = false

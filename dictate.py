@@ -39,11 +39,15 @@ def load_config():
     if CONFIG_PATH.exists():
         config.read(CONFIG_PATH)
 
+    language_raw = config.get("whisper", "language", fallback="en").strip().lower()
+    language = None if language_raw in {"auto", "none"} else (language_raw or "en")
+
     return {
         # Whisper
         "model": config.get("whisper", "model", fallback="base.en"),
         "device": config.get("whisper", "device", fallback="cpu"),
         "compute_type": config.get("whisper", "compute_type", fallback="int8"),
+        "language": language,
         # Input device
         "audio_input_device": config.get("input", "audio_input_device", fallback=None),
         # Hotkey
@@ -365,6 +369,7 @@ class Dictation:
         segments, info = self.model.transcribe(
             audio_array,
             vad_filter=True,
+            language=self.config.get("language"),
         )
         # Convert segments to text.
         text = self._segments_to_text(segments, self.config["auto_sentence"])
@@ -789,7 +794,7 @@ class StreamingDictation(Dictation):
                     # FYI: don't set temperature=0.0, it will cause errors like
                     # "Log probability threshold is not met with temperature 0.0 (-1.359611 < -1.000000)"
                     # temperature=0.0, 
-                    language="en",
+                    language=self.config.get("language"),
                     condition_on_previous_text=True,
                     without_timestamps=True,
                 )

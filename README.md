@@ -146,6 +146,23 @@ mkdir -p ~/.config/soupawhisper
 cp config.example.ini ~/.config/soupawhisper/config.ini
 ```
 
+### Language (English, Spanish, auto-detect)
+
+To force a language:
+
+```ini
+[whisper]
+language = en  # or: es
+```
+
+To transcribe multiple languages (for example English and Spanish), enable auto-detect and use a multilingual model (avoid `*.en` models):
+
+```ini
+[whisper]
+model = base
+language = auto
+```
+
 ### Audio Device Configuration
 
 Both streaming and non-streaming modes use PyAudio for audio recording. To configure which audio input device to use:
@@ -203,6 +220,9 @@ Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
 | large-v3  | ~3GB   | Slowest | Best     |
 
 For dictation, `base.en` or `small.en` is usually the sweet spot.
+
+Note: `*.en` models (like `base.en`) are English-only and usually slightly better for English dictation.
+For multilingual dictation, use `base`, `small`, `medium`, or `large-v3` and set `language = auto`.
 
 ## Testing
 
