@@ -3,20 +3,17 @@
 **SoupaWhisper** is a local voice dictation tool for Linux designed for low resources machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
 
 Target workflow (streaming mode) is:
-- press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence,
-- wait a moment until text appears in the active input field,
-- type custom term/characters sequence,
+- press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence (even most sophisticated speech recognition systems can't handle URLs, email addresses, names, etc.),
+- type custom term/characters sequence on the keyboard,
 - continue speaking,
-- press a hotkey again to stop transcribing and get recent words in the active input field.
+- press a hotkey when you finished.
 
 It increases your words-per-minute speed in 3-4 times, from ~40 WPM to ~150 WPM. Even professionals can't type faster than 75 WPM ([ref](https://www.medrxiv.org/content/10.1101/2025.05.11.25327386v1.full)).
 
-- **Push-to-talk (non-streaming):** Hold a hotkey to record, release to transcribe the full recording and insert the text.
 - **Streaming:** Start/stop with the hotkey; speech is split by silence (VAD) and transcribed in chunks so text appears as you speak.
+- **Push-to-talk (non-streaming):** Hold a hotkey to record, release to transcribe the full recording and insert the text. May not behave correctly in terminals or other environments that handle keyboard input in special ways.
 
 Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU support for faster transcription.
-
-> **Note:** Streaming push-to-talk works in most apps but may not behave correctly in terminals or other environments that handle keyboard input in special ways.
 
 ---
 
