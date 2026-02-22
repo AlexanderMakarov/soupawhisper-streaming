@@ -163,9 +163,23 @@ Recording uses PyAudio. To choose the input device:
 **Keyboard / permissions**
 
 ```bash
-sudo usermod -aG input $USER
-# then log out and back in
+sudo usermod -aG input $USER # Adds your user to the 'input' group, which allows access to input devices.
+# Now log out and back in.
 ```
+
+**Bad transcription quality**
+
+To verify what is being captured (e.g. wrong device, silence, or bad quality), enable persistent recordings in config and listen to the files:
+
+- In `~/.config/soupawhisper/config.ini`, under `[behavior]`, set:
+  ```ini
+  save_recordings = true
+  ```
+- Run a short dictation. Recordings are written under `/tmp`:
+  - Non-streaming: `recording_YYYYMMDD_HHMMSS.wav`
+  - Streaming: `stream_chunk_YYYYMMDD_HHMMSS.wav` (one file per speech chunk)
+- Play a file to hear how it sounds. Often issues are in the recording, not the transcription model.
+- Set `save_recordings = false` when you are done debugging.
 
 **cuDNN / GPU errors**
 
@@ -183,7 +197,7 @@ If you see errors about `libcudnn_ops.so.9`, install cuDNN 9 for your CUDA versi
 | medium.en | ~1.5GB | Slower  | Great    |
 | large-v3  | ~3GB   | Slowest | Best     |
 
-For dictation, `base.en` or `small.en` is usually the best tradeoff.
+For streaming dictation, `base.en` or `small.en` is usually the best tradeoff. Bigger models are much slower while to increase a quality better to buy a good microphone.
 
 ---
 
