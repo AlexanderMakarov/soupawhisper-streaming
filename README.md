@@ -1,23 +1,42 @@
 # SoupaWhisper
 
-A simple local push-to-talk (not streaming) or press-to-toggle (streaming) voice dictation tool for Linux using faster-whisper.
-It automatically copies to clipboard and types into the active input. Streaming transcribes speech chunks as some silence is detected. Not-streaming transcribes the entire audio file at once.
+**SoupaWhisper** is a local voice dictation tool for Linux designed for low resources machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
 
-Note that push-to-talk is possible in a streaming mode but can't be used with terminal applications with paralell typing.
+Target workflow (streaming mode) is:
+- press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence,
+- wait a moment until text appears in the active input field,
+- type custom term/characters sequence,
+- continue speaking,
+- press a hotkey again to stop transcribing and get recent words in the active input field.
+
+It increases your words-per-minute speed in 3-4 times, from ~40 WPM to ~150 WPM. Even professionals can't type faster than 75 WPM ([ref](https://www.medrxiv.org/content/10.1101/2025.05.11.25327386v1.full)).
+
+- **Push-to-talk (non-streaming):** Hold a hotkey to record, release to transcribe the full recording and insert the text.
+- **Streaming:** Start/stop with the hotkey; speech is split by silence (VAD) and transcribed in chunks so text appears as you speak.
+
+Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU support for faster transcription.
+
+> **Note:** Streaming push-to-talk works in most apps but may not behave correctly in terminals or other environments that handle keyboard input in special ways.
+
+---
 
 ## Requirements
 
-- Python 3.10+
-- Poetry or uv
-- Linux with X11
-- Any Linux supported by PyAudio
+- **Python 3.10+**
+- **Poetry** or **uv**
+- **Linux with X11** (for `xclip`, `xdotool`, notifications)
+- **[PyAudio](https://people.csail.mit.edu/hubert/pyaudio/)** (system packages below)
 
-## Supported Distros
+### System dependencies by distro
 
-- Ubuntu / Pop!_OS / Debian (apt)
-- Fedora (dnf)
-- Arch Linux (pacman)
-- openSUSE (zypper)
+| Distro | Install command |
+|--------|-----------------|
+| Ubuntu / Pop!_OS / Debian | `sudo apt install xclip xdotool libnotify-bin portaudio19-dev` |
+| Fedora | `sudo dnf install xclip xdotool libnotify portaudio-devel` |
+| Arch Linux | `sudo pacman -S xclip xdotool libnotify portaudio` |
+| openSUSE | `sudo zypper install xclip xdotool libnotify portaudio-devel` |
+
+---
 
 ## Installation
 
@@ -28,171 +47,136 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer will:
-1. Detect your package manager
-2. Install system dependencies
-3. Install Python dependencies via Poetry or uv
-4. Set up the config file
-5. Optionally install as a systemd service
+The installer will detect your package manager, install system and Python dependencies (Poetry or uv), create the config file, and optionally install a systemd user service.
 
-### Manual Installation
+### Manual setup
+
+Install system packages from the table above, then:
 
 ```bash
-# Ubuntu/Debian
-sudo apt install xclip xdotool libnotify-bin portaudio19-dev
-
-# Fedora
-sudo dnf install xclip xdotool libnotify portaudio-devel
-
-# Arch
-sudo pacman -S xclip xdotool libnotify portaudio
-
-# Then install Python deps
 poetry install
-# OR with uv:
+# or
 uv sync
 ```
 
-### GPU Support (Optional)
+Copy and customize the config:
 
-For NVIDIA GPU acceleration, install cuDNN 9:
-
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install libcudnn9-cuda-12
-```
-
-Then edit `~/.config/soupawhisper/config.ini`:
-```ini
-device = cuda
-compute_type = float16
-```
-
-## Usage
-
-### With Poetry
-
-```bash
-poetry run python dictate.py
-```
-
-### With uv
-
-```bash
-uv run python dictate.py
-```
-
-### Using Makefile
-
-```bash
-make run           # Run in default mode
-make run-stream    # Run in streaming mode
-make run-no-stream # Run in non-streaming mode
-make test          # Run tests in virtual environment
-```
-
-### Operation
-
-- Press the configured hotkey (default: **F12**) to start transcribing
-- (not-streaming) Release the hotkey → transcribes, copies to clipboard, and types into active input.
-- (streaming) Press the hotkey again to stop transcribing.
-- Press **Ctrl+C** to quit (when running manually)
-
-### Streaming vs Non-Streaming Mode
-
-**Non-Streaming Mode** (default):
-- Records entire audio, then transcribes all at once
-- Text appears only after you stop recording
-- Better for short, precise dictations
-- Slightly more accurate for complete sentences
-- Use `--no-streaming` flag or set `default_streaming = false` in config
-
-**Streaming Mode**:
-- Uses WebRTC VAD (Voice Activity Detection) to detect when you speak
-- Transcribes natural voice segments (sentences / phrases) one by one as they are detected
-- Text appears incrementally as you speak, after short silence breaks are detected
-- Better for longer dictations and more natural sentence boundaries
-- Use `--streaming` flag or set `default_streaming = true` in config
-
-## Run as a systemd Service
-
-The installer can set this up automatically. If you skipped it, run:
-
-```bash
-./install.sh  # Select 'y' when prompted for systemd
-```
-
-### Service Commands
-
-Use `make` commands or directly:
-
-```bash
-systemctl --user start soupawhisper     # Start
-systemctl --user stop soupawhisper      # Stop
-systemctl --user restart soupawhisper   # Restart
-systemctl --user status soupawhisper    # Status
-journalctl --user -u soupawhisper -f    # View logs
-```
-
-## Configuration
-
-Edit `~/.config/soupawhisper/config.ini` - it contains explanations for each option.
-
-Create the config directory and file if it doesn't exist:
 ```bash
 mkdir -p ~/.config/soupawhisper
 cp config.example.ini ~/.config/soupawhisper/config.ini
 ```
 
-### Audio Device Configuration
+### GPU support (optional)
 
-Both streaming and non-streaming modes use PyAudio for audio recording. To configure which audio input device to use:
+For NVIDIA GPU acceleration, install cuDNN 9 and set in `~/.config/soupawhisper/config.ini`:
 
-1. **Find available devices**: Run the application with `--verbose` flag to see a list of available audio input devices in the logs.
-2. **Set device in config**: Edit `~/.config/soupawhisper/config.ini` and set the `audio_input_device` option in the `[streaming]` section:
-  ```ini
-   [streaming]
-   audio_input_device = 0
-  ```
-   You can specify either:
-  - A device index (integer, e.g., `0`, `8`)
-  - A partial device name (string, e.g., `"pulse"`, `"HDA Intel"`) - the first matching device will be used
-3. **Default behavior**: If `audio_input_device` is not set or empty, PyAudio will use the system default input device.
+```ini
+device = cuda
+compute_type = float16
+```
+
+(See [NVIDIA cuDNN](https://developer.nvidia.com/cudnn) for package instructions for your distro.)
+
+---
+
+## Usage
+
+**Recommended:** use the Makefile (auto-picks Poetry or uv):
+
+```bash
+make run           # default mode (config-driven)
+make run-stream    # streaming
+make run-no-stream # non-streaming
+make run-file F=path/to/audio.wav   # transcribe a file
+```
+
+Or run directly:
+
+```bash
+poetry run python dictate.py
+# or
+uv run python dictate.py
+```
+
+Add `--streaming` or `--no-streaming` to override config. Use `--verbose` to list audio devices.
+
+### Behavior
+
+- **Hotkey** (default **F12**): start/stop recording (or hold for push-to-talk in non-streaming).
+- **Non-streaming:** release hotkey → full recording is transcribed, then text is copied and typed into the focused field.
+- **Streaming:** press hotkey again to stop; text is emitted in chunks as silence is detected.
+- **Ctrl+C** quits when run in the foreground.
+
+### Modes
+
+| Mode | Flag / config | Best for |
+|------|----------------|----------|
+| **Non-streaming** | `--no-streaming` or `default_streaming = false` | Short, precise dictation; full-sentence accuracy. |
+| **Streaming** | `--streaming` or `default_streaming = true` | Longer dictation; text appears incrementally after short pauses. |
+
+---
+
+## Run as a systemd service
+
+If you didn’t enable it during install:
+
+```bash
+./install.sh   # choose 'y' for systemd
+```
+
+Or reinstall only the service (deps already installed):
+
+```bash
+make service-reinstall
+```
+
+**Service commands:**
+
+```bash
+make service-start    # or systemctl --user start soupawhisper
+make service-stop     # or systemctl --user stop soupawhisper
+make service-restart  # or systemctl --user restart soupawhisper
+make service-status   # or systemctl --user status soupawhisper
+make service-logs     # or journalctl --user -u soupawhisper -f
+```
+
+---
+
+## Configuration
+
+Edit `~/.config/soupawhisper/config.ini`. Options are documented in the file.
+
+### Audio input device
+
+Recording uses PyAudio. To choose the input device:
+
+1. Run with `--verbose` to print available input devices and indices.
+2. In `config.ini`, under `[streaming]`, set `audio_input_device` to a device index (e.g. `0`) or a partial name (e.g. `"pulse"`, `"HDA Intel"`). Leave unset to use the system default.
+
+---
 
 ## Troubleshooting
 
-**No audio recording:**
-```bash
-# Run with --verbose to see available audio devices
-poetry run python dictate.py --verbose
-# OR
-uv run python dictate.py --verbose
+**No audio / wrong device**
 
-# The logs will show available input devices with their indices
-# Then set audio_input_device in your config file
-```
+- Run with `--verbose` and check the listed input devices.
+- Set `audio_input_device` in config to the correct index or name.
+- Ensure the microphone works in system settings and isn’t muted.
 
-If no audio is detected, the application will show a notification with available devices. Check that:
-- Your microphone is connected and working
-- The correct audio input device is selected in your system settings
-- The `audio_input_device` setting in config matches your device index or name
-
-**Permission issues with keyboard:**
+**Keyboard / permissions**
 
 ```bash
 sudo usermod -aG input $USER
-# Then log out and back in
+# then log out and back in
 ```
 
-**cuDNN errors with GPU:**
-```
-Unable to load any of {libcudnn_ops.so.9...}
-```
-Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
+**cuDNN / GPU errors**
 
-## Model Sizes
+If you see errors about `libcudnn_ops.so.9`, install cuDNN 9 for your CUDA version or set `device = cpu` in config.
+
+---
+
+## Model sizes
 
 | Model     | Size   | Speed   | Accuracy |
 | --------- | ------ | ------- | -------- |
@@ -202,36 +186,32 @@ Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
 | medium.en | ~1.5GB | Slower  | Great    |
 | large-v3  | ~3GB   | Slowest | Best     |
 
-For dictation, `base.en` or `small.en` is usually the sweet spot.
+For dictation, `base.en` or `small.en` is usually the best tradeoff.
+
+---
 
 ## Testing
-
-### With Poetry
-
-```bash
-poetry run pytest dictate_tests.py
-```
-
-### With uv
-
-```bash
-uv run pytest dictate_tests.py
-```
-
-### Using Makefile
 
 ```bash
 make test
 ```
 
+Or:
+
+```bash
+poetry run pytest dictate_tests.py
+# or
+uv run pytest dictate_tests.py
+```
+
+---
+
 # TODO/Roadmap
 
-- [x] Migrate everything to PyAudio.
-- [x] Fix issue with not pasting final text to input field.
-- [x] Fix issue with not transcribing audio if hotkey was pressed while dictation was in progress.
-- [x] Fix issue with skipping the last segment. Repro on big models.
-- [x] Fix wrong duration in `[transcriber] Transcribed 5.54s in 0.02s:` logs.
-- [ ] Add setting to keep context of the previous transcription. E.g. use previous transcription as `initial_prompt` parameter.
-- [ ] Add context with the first word. E.g. "Python" word at the start turns `initial_prompt` parameter to "Speech about task in Python programming language".
-- [ ] Set language with the first word.
-- [ ] Add ability to tune `model.transcribe()` parameters via config.
+- [x] PyAudio for all recordings (no `arecord` dependency).
+- [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
+- [ ] Support list of custom terms or pronunciation features (like accents or speech patterns).
+- [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
+- [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
+- [ ] Multiple languages support.
+- [ ] Expose more `model.transcribe()` options in config.
