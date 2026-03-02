@@ -8,6 +8,7 @@ import threading
 import signal
 import sys
 import os
+import platform
 import queue
 import time
 import wave
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
 DEFAULT_HOTKEY = "f12"
+IS_MACOS = platform.system() == "Darwin"
 
 
 def load_config():
@@ -78,19 +80,33 @@ def get_hotkey(key_name: str) -> keyboard.KeyCode:
         return get_hotkey(DEFAULT_HOTKEY)
 
 
+def keys_match(event_key, hotkey) -> bool:
+    """Return True if the event key matches the hotkey (cross-platform, e.g. macOS KeyCode vs Key)."""
+    if event_key == hotkey:
+        return True
+    # On macOS, listener may send KeyCode(vk=X) for function keys while we have Key.f10.
+    # Key.f10.value is the corresponding KeyCode, so compare to that.
+    if hasattr(hotkey, "value") and hotkey.value is not None and event_key == hotkey.value:
+        return True
+    return False
+
+
 class Typer:
-    """Types and removes characters in any inputs via xdotool."""
+    """Types and removes characters in any input field via xdotool (Linux) or AppleScript (macOS)."""
 
     def __init__(self, delay_ms: int = 10, start_delay_ms: int = 250):
         self.delay_ms = max(1, int(delay_ms))
         self.start_delay_ms = int(start_delay_ms)
-        self.enabled = subprocess.run(["which", "xdotool"], capture_output=True).returncode == 0
-        if not self.enabled:
-            logger.warning("[typer] xdotool not found, typing disabled")
+        if IS_MACOS:
+            self.enabled = True
+        else:
+            self.enabled = subprocess.run(["which", "xdotool"], capture_output=True).returncode == 0
+            if not self.enabled:
+                logger.warning("[typer] xdotool not found, typing disabled")
 
     def type_rewrite(self, text: str, previous_length: int = 0):
         """
-        Type text using xdotool.
+        Type text into the focused field.
 
         Args:
             text: The text to type.
@@ -100,17 +116,29 @@ class Typer:
             return
         if self.start_delay_ms > 0:
             time.sleep(self.start_delay_ms / 1000.0)
-        # Remove previous characters if needed.
+        if IS_MACOS:
+            self._type_macos(text, previous_length)
+        else:
+            self._type_linux(text, previous_length)
+
+    def _type_macos(self, text: str, previous_length: int = 0):
+        if previous_length > 0:
+            script = f'tell application "System Events" to key code 51 using {{}} -- delete\n' * previous_length
+            subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        # Escape for AppleScript string: backslashes then double quotes.
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'tell application "System Events" to keystroke "{escaped}"'
+        subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+
+    def _type_linux(self, text: str, previous_length: int = 0):
         if previous_length > 0:
             subprocess.run(
-                ["xdotool", "key", "BackSpace", "--clearmodifiers", "--repeat", str(previous_length)],#, "--repeat-delay", str(self.delay_ms)],
+                ["xdotool", "key", "BackSpace", "--clearmodifiers", "--repeat", str(previous_length)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=2
             )
-        # Type the new text.
         subprocess.run(
-            # ["xdotool", "type", "--delay", str(self.delay_ms), "--clearmodifiers", text],
             ["xdotool", "type", "--delay", str(self.delay_ms), text],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -311,18 +339,24 @@ class Dictation:
         log_method("Showing notification: %s, %s, %s, %s", title, message, icon, timeout)
         if not self.config["notifications"]:
             return
-        subprocess.run(
-            [
-                "notify-send",
-                "-a", "SoupaWhisper",
-                "-i", icon,
-                "-t", str(timeout),
-                "-h", "string:x-canonical-private-synchronous:soupawhisper",
-                title,
-                message
-            ],
-            capture_output=True
-        )
+        if IS_MACOS:
+            escaped_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+            escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+            script = f'display notification "{escaped_msg}" with title "{escaped_title}" subtitle "SoupaWhisper"'
+            subprocess.run(["osascript", "-e", script], capture_output=True)
+        else:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "-a", "SoupaWhisper",
+                    "-i", icon,
+                    "-t", str(timeout),
+                    "-h", "string:x-canonical-private-synchronous:soupawhisper",
+                    title,
+                    message
+                ],
+                capture_output=True
+            )
 
     def _segments_to_text(self, segments: Iterable[Segment], auto_sentence: bool) -> str:
         """Format text as a sentence: capitalize first letter and add period at end if needed."""
@@ -371,11 +405,11 @@ class Dictation:
         return text, info.duration
 
     def on_press(self, key):
-        if key == self.hotkey:
+        if keys_match(key, self.hotkey):
             self.start_recording()
 
     def on_release(self, key):
-        if key == self.hotkey:
+        if keys_match(key, self.hotkey):
             self.stop_recording()
 
     def stop(self):
@@ -478,10 +512,8 @@ class Dictation:
             if text:
                 logger.info(f"Transcribed {duration:.2f}s in {trans_duration:.2f}s: {text}")
                 if self.config["clipboard"]:
-                    process = subprocess.Popen(
-                        ["xclip", "-selection", "clipboard"],
-                        stdin=subprocess.PIPE
-                    )
+                    clip_cmd = ["pbcopy"] if IS_MACOS else ["xclip", "-selection", "clipboard"]
+                    process = subprocess.Popen(clip_cmd, stdin=subprocess.PIPE)
                     process.communicate(input=text.encode())
                     logger.info(f"Pasted to clipboard: {text}")
                 if self.config["auto_type"] and self.typer:
@@ -582,7 +614,7 @@ class StreamingDictation(Dictation):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
     def on_press(self, key):
-        if key == self.hotkey:
+        if keys_match(key, self.hotkey):
             if not self.recording:
                 self.start_recording()
             else:
@@ -905,10 +937,8 @@ class StreamingDictation(Dictation):
         final_text = self.accumulated_text.strip()
         if final_text:
             if self.config["clipboard"]:
-                process = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard"],
-                    stdin=subprocess.PIPE
-                )
+                clip_cmd = ["pbcopy"] if IS_MACOS else ["xclip", "-selection", "clipboard"]
+                process = subprocess.Popen(clip_cmd, stdin=subprocess.PIPE)
                 process.communicate(input=final_text.encode())
                 logger.info(f"[idle] Pasted to clipboard: {final_text}")
             logger.info(f"[idle] Final text: {final_text}")
@@ -985,8 +1015,10 @@ class StreamingDictation(Dictation):
 
 def check_dependencies(config: dict):
     """Check that required system commands are available."""
+    if IS_MACOS:
+        # macOS uses pbcopy and osascript (AppleScript) which are always present.
+        return
     missing = []
-    # System command dependencies.
     required_cmds = []
     if config["clipboard"]:
         required_cmds.append("xclip")
@@ -995,7 +1027,6 @@ def check_dependencies(config: dict):
     for cmd in required_cmds:
         if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
             missing.append((cmd, cmd))
-    # Check for missing dependencies.
     if missing:
         logger.error("Missing dependencies:")
         for cmd, pkg in missing:
