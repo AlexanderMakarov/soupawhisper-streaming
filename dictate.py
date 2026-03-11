@@ -80,15 +80,37 @@ def get_hotkey(key_name: str) -> keyboard.KeyCode:
         return get_hotkey(DEFAULT_HOTKEY)
 
 
-def keys_match(event_key, hotkey) -> bool:
-    """Return True if the event key matches the hotkey (cross-platform, e.g. macOS KeyCode vs Key)."""
+def keys_match(
+    event_key,
+    hotkey,
+    hotkey_value=None,
+    hotkey_vk=None,
+) -> bool:
+    """Return True if the event key matches the hotkey (cross-platform, e.g. macOS KeyCode vs Key).
+
+    Pass hotkey_value and hotkey_vk (e.g. from _hotkey_value, _hotkey_vk) to avoid
+    repeated getattr on every keypress.
+    """
     if event_key == hotkey:
         return True
-    # On macOS, listener may send KeyCode(vk=X) for function keys while we have Key.f10.
-    # Key.f10.value is the corresponding KeyCode, so compare to that.
+    if hotkey_value is not None and event_key == hotkey_value:
+        return True
+    if hotkey_vk is not None:
+        event_vk = getattr(event_key, "vk", None)
+        if event_vk is not None and event_vk == hotkey_vk:
+            return True
+        return False
+    # Fallback when precomputed values not passed (e.g. tests)
     if hasattr(hotkey, "value") and hotkey.value is not None and event_key == hotkey.value:
         return True
-    return False
+    event_vk = getattr(event_key, "vk", None)
+    hotkey_ref = getattr(hotkey, "value", None) or hotkey
+    hotkey_vk_val = getattr(hotkey_ref, "vk", None)
+    return (
+        event_vk is not None
+        and hotkey_vk_val is not None
+        and event_vk == hotkey_vk_val
+    )
 
 
 class Typer:
@@ -150,6 +172,10 @@ class Dictation:
     def __init__(self, config: dict):
         self.config = config
         self.hotkey = get_hotkey(config["key"])
+        # Precompute for keys_match (avoids getattr on every keypress)
+        self._hotkey_value = getattr(self.hotkey, "value", None)
+        hv = self._hotkey_value
+        self._hotkey_vk = getattr(hv, "vk", None) if hv is not None else getattr(self.hotkey, "vk", None)
         self.recording = False
         self.model = None
         self.model_loaded = threading.Event()
@@ -405,11 +431,11 @@ class Dictation:
         return text, info.duration
 
     def on_press(self, key):
-        if keys_match(key, self.hotkey):
+        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
             self.start_recording()
 
     def on_release(self, key):
-        if keys_match(key, self.hotkey):
+        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
             self.stop_recording()
 
     def stop(self):
@@ -614,7 +640,7 @@ class StreamingDictation(Dictation):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
     def on_press(self, key):
-        if keys_match(key, self.hotkey):
+        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
             if not self.recording:
                 self.start_recording()
             else:
@@ -1098,8 +1124,34 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
         metavar="WAV_FILE",
         help="Transcribe provided WAV file and exit"
     )
+    parser.add_argument(
+        "--test-keys",
+        action="store_true",
+        help="Listen and print key events (for hotkey troubleshooting). Press Ctrl+C to exit."
+    )
     args = parser.parse_args()
     check_dependencies(config)
+
+    # Test keys mode: print every key press and whether it matches configured hotkey.
+    if args.test_keys:
+        config = load_config()
+        hotkey = get_hotkey(config["key"])
+        hotkey_value = getattr(hotkey, "value", None)
+        hotkey_vk = getattr(hotkey_value, "vk", None) if hotkey_value else getattr(hotkey, "vk", None)
+        hotkey_name = getattr(hotkey, "name", None) or getattr(hotkey, "char", config["key"])
+        print(f"Configured hotkey: {hotkey_name} (value={hotkey_value}, vk={hotkey_vk})")
+        print("Press keys (e.g. F10). Matching key will show [MATCH]. Ctrl+C to exit.\n")
+        def on_press(key):
+            try:
+                name = getattr(key, "name", None) or getattr(key, "char", repr(key))
+                vk = getattr(key, "vk", None)
+            except Exception:
+                name, vk = repr(key), None
+            match = keys_match(key, hotkey, hotkey_value, hotkey_vk)
+            print(f"  Key: {name} vk={vk}  {'[MATCH]' if match else ''}")
+        with keyboard.Listener(on_press=on_press) as listener:
+            listener.join()
+        return
 
     # Apply arguments.
     if args.verbose:
