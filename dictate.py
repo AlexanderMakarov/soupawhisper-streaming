@@ -29,6 +29,24 @@ __version__ = "0.1.0"
 # Logger will be configured in main()
 logger = logging.getLogger(__name__)
 
+# Streaming chunks are already speech from WebRTC VAD; Silero uses looser settings than
+# the library default (min_silence_duration_ms=2000 is for long files and can wipe short clips).
+_STREAMING_VAD_PARAMETERS = {
+    "threshold": 0.33,
+    "min_speech_duration_ms": 0,
+    "min_silence_duration_ms": 120,
+    "speech_pad_ms": 200,
+}
+
+def _streaming_segments_to_text(segments: Iterable[Segment]) -> str:
+    parts: list[str] = []
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        parts.append(text)
+    return " ".join(parts).strip()
+
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
 DEFAULT_HOTKEY = "f12"
@@ -835,24 +853,18 @@ class StreamingDictation(Dictation):
                 # Convert int16 to float32 and normalize to [-1.0, 1.0]
                 if segment.dtype == np.int16:
                     segment = segment.astype(np.float32) / 32768.0
-                # Use time.time() to match log timestamps (wall-clock time)
-                # Note: transcribe() returns an iterator, so actual work happens when we iterate
+                # Note: transcribe() returns an iterator; iteration runs the decoder.
                 trans_start = time.monotonic()
-                segments, info = self.model.transcribe(
+                segments, _ = self.model.transcribe(
                     segment,
-                    # FYI: don't disable vad_filter, it will cause errors like
-                    # "No speech threshold is met (0.620832 > 0.600000)"
-                    # if we detected speech incorrectly or cutted with big gaps inside.
+                    # Second VAD pass with options tuned for short clips (see _STREAMING_VAD_PARAMETERS).
                     vad_filter=True,
-                    # FYI: don't set temperature=0.0, it will cause errors like
-                    # "Log probability threshold is not met with temperature 0.0 (-1.359611 < -1.000000)"
-                    # temperature=0.0, 
+                    vad_parameters=_STREAMING_VAD_PARAMETERS,
                     language="en",
                     condition_on_previous_text=True,
                     without_timestamps=True,
                 )
-                # Consume the iterator to trigger actual transcription work.
-                text = self._segments_to_text(segments, False)
+                text = _streaming_segments_to_text(segments)
                 trans_duration = time.monotonic() - trans_start
                 if not text:
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
