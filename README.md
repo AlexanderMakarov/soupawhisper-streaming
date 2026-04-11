@@ -1,6 +1,6 @@
 # SoupaWhisper
 
-**SoupaWhisper** is a local voice dictation tool for Linux designed for low resources machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
+**SoupaWhisper** is a local voice dictation tool for Linux and designed for low resources machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
 
 Target workflow (streaming mode) is:
 - press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence (even most sophisticated speech recognition systems can't handle URLs, email addresses, names, etc.),
@@ -63,22 +63,31 @@ mkdir -p ~/.config/soupawhisper
 cp config.example.ini ~/.config/soupawhisper/config.ini
 ```
 
-### Language (English, Spanish, auto-detect)
+### Language (English, Spanish, Russian, auto-detect)
 
-To force a language:
+Whisper uses [ISO 639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) language codes (`en`, `es`, `ru`, …). **Any language other than English-only dictation requires a multilingual model** — names **without** the `.en` suffix (for example `base`, not `base.en`). Models ending in `.en` transcribe English only.
+
+**English (optimized):** default config often uses `model = base.en` and `language = en`.
+
+**Spanish (or another single language):** set the code and a multilingual model, for example:
 
 ```ini
 [whisper]
-language = en  # or: es
+model = base
+language = es
 ```
 
-To transcribe multiple languages (for example English and Spanish), enable auto-detect and use a multilingual model (avoid `*.en` models):
+Transcription is emitted in that language’s script (e.g. Cyrillic for Russian). The focused app must accept that text (system keyboard/layout or IME as needed).
+
+**Several languages in one session** (mixed speech or switching): use auto-detect and a multilingual model:
 
 ```ini
 [whisper]
 model = base
 language = auto
 ```
+
+**Spanish or other languages** forced to one language: same pattern as Russian — `language = es` (etc.) and a non-`*.en` `model`.
 
 ### GPU support (optional)
 
@@ -224,20 +233,23 @@ If you see errors about `libcudnn_ops.so.9`, install cuDNN 9 for your CUDA versi
 
 ## Model sizes
 
-| Model     | Size   | Speed   | Accuracy |
-| --------- | ------ | ------- | -------- |
-| tiny.en   | ~75MB  | Fastest | Basic    |
-| base.en   | ~150MB | Fast    | Good     |
-| small.en  | ~500MB | Medium  | Better   |
-| medium.en | ~1.5GB | Slower  | Great    |
-| large-v3  | ~3GB   | Slowest | Best     |
+Sizes are approximate. **English-only** models (`*.en`) are a bit better for English-only dictation. **Multilingual** models (same size tier, name **without** `.en`: `tiny`, `base`, `small`, `medium`, `large-v3`) are required for Russian, other non-English languages, or `language = auto`.
 
-For streaming dictation, `base.en` or `small.en` is usually the best tradeoff. Bigger models are much slower while to increase a quality better to buy a good microphone.
+| Model      | Scope           | Size   | Speed   | Accuracy |
+| ---------- | --------------- | ------ | ------- | -------- |
+| tiny.en    | English only    | ~75MB  | Fastest | Basic    |
+| base.en    | English only    | ~150MB | Fast    | Good     |
+| small.en   | English only    | ~500MB | Medium  | Better   |
+| medium.en  | English only    | ~1.5GB | Slower  | Great    |
+| tiny       | Multilingual    | ~75MB  | Fastest | Basic    |
+| base       | Multilingual    | ~150MB | Fast    | Good     |
+| small      | Multilingual    | ~500MB | Medium  | Better   |
+| medium     | Multilingual    | ~1.5GB | Slower  | Great    |
+| large-v3   | Multilingual    | ~3GB   | Slowest | Best     |
+
+For **English-only** streaming dictation, `base.en` or `small.en` is usually the best tradeoff. For **Russian or multilingual** use, prefer `base` / `small` / `medium` / `large-v3` (no `.en`) and set `language` as in [Language](#language-english-spanish-russian-auto-detect) above. Larger models are much slower; improving quality often starts with a better microphone.
 
 ---
-
-Note: `*.en` models (like `base.en`) are English-only and usually slightly better for English dictation.
-For multilingual dictation, use `base`, `small`, `medium`, or `large-v3` and set `language = auto`.
 
 ## Testing
 
@@ -259,8 +271,8 @@ uv run pytest dictate_tests.py
 
 - [x] PyAudio for all recordings (no `arecord` dependency).
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
+- [x] Multiple languages support.
 - [ ] Support list of custom terms or pronunciation features (like accents or speech patterns).
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
-- [x] Multiple languages support.
 - [ ] Expose more `model.transcribe()` options in config.
