@@ -1,6 +1,6 @@
-# SoupaWhisper
+# SoupaWhisper Streaming
 
-**SoupaWhisper** is a local voice dictation tool for **Linux** and **macOS**, aimed at low-resource machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
+**SoupaWhisper Streaming** is a local voice dictation tool for **Linux** and **macOS**, aimed at low-resource machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
 
 Target workflow (streaming mode) is:
 - press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence (even most sophisticated speech recognition systems can't handle URLs, email addresses, names, etc.),
