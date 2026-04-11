@@ -1,12 +1,37 @@
 #!/bin/bash
-# Install SoupaWhisper on Linux
-# Supports: Ubuntu, Pop!_OS, Debian, Fedora, Arch
+# Install SoupaWhisper on Linux and macOS
+# Linux: systemd user service (Ubuntu, Pop!_OS, Debian, Fedora, Arch)
+# macOS: launchd user LaunchAgent
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$HOME/.config/soupawhisper"
 SERVICE_DIR="$HOME/.config/systemd/user"
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+PLIST_LABEL="com.soupawhisper.dictate"
+LOG_FILE="$HOME/Library/Logs/soupawhisper.log"
+
+is_macos() {
+    [ "$(uname -s)" = "Darwin" ]
+}
+
+# Get venv path (used by both Linux and macOS service install)
+get_venv_path() {
+    local pm
+    pm=$(detect_python_manager)
+    case $pm in
+        uv)
+            echo "$SCRIPT_DIR/.venv"
+            ;;
+        poetry)
+            poetry env info --path 2>/dev/null || echo "$SCRIPT_DIR/.venv"
+            ;;
+        *)
+            echo "$SCRIPT_DIR/.venv"
+            ;;
+    esac
+}
 
 # Detect package manager
 detect_package_manager() {
@@ -23,8 +48,12 @@ detect_package_manager() {
     fi
 }
 
-# Install system dependencies
+# Install system dependencies (Linux only)
 install_deps() {
+    if is_macos; then
+        echo "macOS detected: skipping system package install (no extra deps required)"
+        return 0
+    fi
     local pm=$(detect_package_manager)
 
     echo "Detected package manager: $pm"
@@ -101,8 +130,8 @@ setup_config() {
     fi
 }
 
-# Install systemd service
-install_service() {
+# Install systemd service (Linux)
+install_service_linux() {
     echo ""
     echo "Installing systemd user service..."
 
@@ -111,24 +140,8 @@ install_service() {
     # Get current display settings
     local display="${DISPLAY:-:0}"
     local xauthority="${XAUTHORITY:-$HOME/.Xauthority}"
-    local venv_path="$SCRIPT_DIR/.venv"
-
-    # Detect Python package manager and get venv path
-    local pm=$(detect_python_manager)
-    case $pm in
-        uv)
-            # UV uses .venv in the script directory
-            venv_path="$SCRIPT_DIR/.venv"
-            ;;
-        poetry)
-            # Try to get Poetry's venv path, fallback to .venv
-            venv_path=$(poetry env info --path 2>/dev/null || echo "$SCRIPT_DIR/.venv")
-            ;;
-        *)
-            # Fallback to .venv
-            venv_path="$SCRIPT_DIR/.venv"
-            ;;
-    esac
+    local venv_path
+    venv_path=$(get_venv_path)
 
     cat > "$SERVICE_DIR/soupawhisper.service" << EOF
 [Unit]
@@ -167,10 +180,75 @@ EOF
 
     echo ""
     echo "Service installed! Commands:"
-    echo "  systemctl --user start soupawhisper   # Start"
-    echo "  systemctl --user stop soupawhisper    # Stop"
-    echo "  systemctl --user status soupawhisper  # Status"
-    echo "  journalctl --user -u soupawhisper -f  # Logs"
+    echo "  make service-start   # or systemctl --user start soupawhisper"
+    echo "  make service-stop    # or systemctl --user stop soupawhisper"
+    echo "  make service-status  # or systemctl --user status soupawhisper"
+    echo "  make service-logs    # or journalctl --user -u soupawhisper -f"
+}
+
+# Install launchd service (macOS)
+install_service_macos() {
+    echo ""
+    echo "Installing launchd user service (LaunchAgent)..."
+
+    mkdir -p "$LAUNCH_AGENTS"
+    mkdir -p "$(dirname "$LOG_FILE")"
+
+    local venv_path
+    venv_path=$(get_venv_path)
+    local python_bin="$venv_path/bin/python"
+    if [ ! -x "$python_bin" ]; then
+        echo "Error: Python not found at $python_bin. Run install without --skip-deps first."
+        exit 1
+    fi
+
+    cat > "$LAUNCH_AGENTS/$PLIST_LABEL.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$PLIST_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$python_bin</string>
+        <string>$SCRIPT_DIR/dictate.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$SCRIPT_DIR</string>
+    <key>StandardOutPath</key>
+    <string>$LOG_FILE</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_FILE</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+    echo "Created plist at $LAUNCH_AGENTS/$PLIST_LABEL.plist"
+    echo "Log file: $LOG_FILE"
+
+    # Unload if already loaded (e.g. reinstall)
+    launchctl unload "$LAUNCH_AGENTS/$PLIST_LABEL.plist" 2>/dev/null || true
+    launchctl load "$LAUNCH_AGENTS/$PLIST_LABEL.plist"
+
+    echo ""
+    echo "Service installed! Commands:"
+    echo "  make service-start   # or launchctl load $LAUNCH_AGENTS/$PLIST_LABEL.plist"
+    echo "  make service-stop    # or launchctl unload $LAUNCH_AGENTS/$PLIST_LABEL.plist"
+    echo "  make service-status  # or launchctl list | grep $PLIST_LABEL"
+    echo "  make service-logs    # tail -f $LOG_FILE"
+}
+
+install_service() {
+    if is_macos; then
+        install_service_macos
+    else
+        install_service_linux
+    fi
 }
 
 # Main
@@ -194,7 +272,7 @@ main() {
                 echo ""
                 echo "Options:"
                 echo "  --skip-deps, --no-deps        Skip installation of OS dependencies (requires sudo)"
-                echo "  --install-service, --service   Automatically install systemd service without prompting"
+                echo "  --install-service, --service   Install systemd (Linux) or launchd (macOS) service without prompting"
                 echo "  -h, --help                    Show this help message"
                 exit 0
                 ;;
@@ -224,7 +302,11 @@ main() {
         install_service
     else
         echo ""
-        read -p "Install as systemd service? [y/N] " -n 1 -r
+        if is_macos; then
+            read -p "Install as launchd service (LaunchAgent)? [y/N] " -n 1 -r
+        else
+            read -p "Install as systemd service? [y/N] " -n 1 -r
+        fi
         echo ""
 
         if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -252,7 +334,13 @@ main() {
     esac
     echo ""
     echo "Config: $CONFIG_DIR/config.ini"
-    echo "Hotkey: F12 (hold to record)"
+    hotkey_key=$(grep -E '^[[:space:]]*key[[:space:]]*=' "$CONFIG_DIR/config.ini" 2>/dev/null | sed -n 's/^[[:space:]]*key[[:space:]]*=[[:space:]]*\(.*\)/\1/p' | tr -d ' ' | tail -1)
+    if [ -n "$hotkey_key" ]; then
+        hotkey_display=$(echo "$hotkey_key" | tr '[:lower:]' '[:upper:]')
+    else
+        hotkey_display="F12"
+    fi
+    echo "Hotkey: $hotkey_display (hold to record)"
     echo "Exit:   Ctrl+C"
 }
 

@@ -73,20 +73,61 @@ test:
 		.venv/bin/pytest dictate_tests.py; \
 	fi
 
+# Service targets: Linux = systemd, macOS = launchd (same label/paths as install.sh)
+SOUPAWHISPER_PLIST = $(HOME)/Library/LaunchAgents/com.soupawhisper.dictate.plist
+SOUPAWHISPER_LOG   = $(HOME)/Library/Logs/soupawhisper.log
+
 service-stop:
-	@systemctl --user stop soupawhisper || echo "Service not running or not installed"
+	@if [ "$(shell uname -s)" = "Darwin" ]; then \
+		launchctl unload "$(SOUPAWHISPER_PLIST)" 2>/dev/null && echo "Stopped soupawhisper" || echo "Service not running or not installed"; \
+	else \
+		command -v systemctl >/dev/null 2>&1 && systemctl --user stop soupawhisper || echo "Service not installed"; \
+	fi
 
 service-start:
-	@systemctl --user start soupawhisper || echo "Service not installed"
+	@if [ "$(shell uname -s)" = "Darwin" ]; then \
+		if [ -f "$(SOUPAWHISPER_PLIST)" ]; then \
+			launchctl load "$(SOUPAWHISPER_PLIST)" && echo "Started soupawhisper"; \
+		else \
+			echo "Service not installed. Run: make service-reinstall"; \
+		fi; \
+	else \
+		command -v systemctl >/dev/null 2>&1 && systemctl --user start soupawhisper || echo "Service not installed"; \
+	fi
 
 service-restart:
-	@systemctl --user restart soupawhisper || echo "Service not installed"
+	@if [ "$(shell uname -s)" = "Darwin" ]; then \
+		if [ -f "$(SOUPAWHISPER_PLIST)" ]; then \
+			launchctl unload "$(SOUPAWHISPER_PLIST)" 2>/dev/null; \
+			launchctl load "$(SOUPAWHISPER_PLIST)" && echo "Restarted soupawhisper"; \
+		else \
+			echo "Service not installed. Run: make service-reinstall"; \
+		fi; \
+	else \
+		command -v systemctl >/dev/null 2>&1 && systemctl --user restart soupawhisper || echo "Service not installed"; \
+	fi
 
 service-status:
-	@systemctl --user status soupawhisper || echo "Service not installed"
+	@if [ "$(shell uname -s)" = "Darwin" ]; then \
+		if [ -f "$(SOUPAWHISPER_PLIST)" ]; then \
+			launchctl list | grep -E "com.soupawhisper.dictate|PID" || echo "Service not loaded"; \
+		else \
+			echo "Service not installed. Run: make service-reinstall"; \
+		fi; \
+	else \
+		command -v systemctl >/dev/null 2>&1 && systemctl --user status soupawhisper || echo "Service not installed"; \
+	fi
 
 service-logs:
-	@journalctl --user -u soupawhisper -f || echo "Service not installed"
+	@if [ "$(shell uname -s)" = "Darwin" ]; then \
+		if [ -f "$(SOUPAWHISPER_LOG)" ]; then \
+			tail -f "$(SOUPAWHISPER_LOG)"; \
+		else \
+			echo "Log file not found. Start the service first: make service-start"; \
+		fi; \
+	else \
+		command -v journalctl >/dev/null 2>&1 && journalctl --user -u soupawhisper -f || echo "journalctl not found"; \
+	fi
 
 record:
 	@if command -v arecord >/dev/null 2>&1; then \

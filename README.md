@@ -162,10 +162,28 @@ Recording uses PyAudio. To choose the input device:
 
 **Keyboard / permissions**
 
+- **Linux:** Add your user to the `input` group so the app can read the keyboard:
+  ```bash
+  sudo usermod -aG input $USER
+  # Log out and back in.
+  ```
+- **macOS – hotkey (e.g. F10) does nothing:**
+  1. **Run in the foreground:** Start the app from Terminal (`uv run python dictate.py` or `make run`) so it can receive key events. The launchd service runs in the background and on macOS typically cannot receive global hotkeys.
+  2. **Grant Accessibility:** Open **System Settings → Privacy & Security → Accessibility** and add **Terminal** (or iTerm / the app you use to run the command). Restart Terminal after adding.
+  3. **Function keys:** If you use F10/F12 etc., ensure **System Settings → Keyboard → "Use F1, F2, etc. keys as standard function keys"** is enabled, or hold **Fn** when pressing F10 so the key is sent as F10 and not as a special key (e.g. mute).
+  4. **Verify key is seen:** Run `uv run python dictate.py --test-keys` (or `poetry run python dictate.py --test-keys`). Press your hotkey (e.g. F10); you should see a line with `[MATCH]`. Press Ctrl+C to exit. If no key events appear, the app is not receiving keyboard input (permissions or run context).
+  5. If you see a pynput warning about "This process is not trusted" or "Input event monitoring will not be possible", add your terminal app (Terminal, iTerm, etc.) to **System Settings → Privacy & Security → Accessibility**, then restart the app.
+
+**Hotkey debugging (`--test-keys`)**
+
+To check whether your configured hotkey is detected at all, run:
+
 ```bash
-sudo usermod -aG input $USER # Adds your user to the 'input' group, which allows access to input devices.
-# Now log out and back in.
+uv run python dictate.py --test-keys
+# or: poetry run python dictate.py --test-keys
 ```
+
+The app will print every key press and mark the configured hotkey with `[MATCH]`. Press keys (e.g. F10) and confirm you see the match; press Ctrl+C to exit. If keys never appear, the process is not receiving keyboard input (on macOS: add your terminal to Accessibility and run in the foreground).
 
 **Bad transcription quality**
 

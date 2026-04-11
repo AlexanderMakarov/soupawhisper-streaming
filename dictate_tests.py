@@ -389,8 +389,10 @@ class TestClipboardIntegration:
 
     def test_check_dependencies_clipboard_optional(self, monkeypatch):
         """Test that xclip is optional in check_dependencies if clipboard is disabled."""
+        # Force Linux path so we test the xclip/xdotool dependency checks.
+        monkeypatch.setattr(dictate, "IS_MACOS", False)
         mock_run = MagicMock()
-        
+
         # Mock 'which' to return 1 for xclip (missing)
         def side_effect(cmd, **kwargs):
             res = MagicMock()
@@ -399,13 +401,13 @@ class TestClipboardIntegration:
             else:
                 res.returncode = 0
             return res
-        
+
         mock_run.side_effect = side_effect
         monkeypatch.setattr(dictate.subprocess, "run", mock_run)
-        
+
         # Should NOT exit if clipboard is False (webrtcvad and pyaudio are already imported, so import check passes)
         dictate.check_dependencies({"clipboard": False, "auto_type": False, "default_streaming": False})
-        
+
         # Should exit if clipboard is True (since xclip is missing)
         with pytest.raises(SystemExit):
             dictate.check_dependencies({"clipboard": True, "auto_type": False, "default_streaming": False})
