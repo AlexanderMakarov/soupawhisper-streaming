@@ -291,7 +291,6 @@ uv run pytest dictate_tests.py
 - [x] PyAudio for all recordings (no `arecord` dependency).
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
 - [x] Multiple languages support.
-- [x] **macOS:** launchd LaunchAgent, Makefile `service-*` targets, `--test-keys` / Accessibility docs, function-key matching for hotkeys ([PR #3](https://github.com/AlexanderMakarov/soupawhisper-streaming/pull/3)).
 - [ ] Support list of custom terms or pronunciation features (like accents or speech patterns).
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
