@@ -1,6 +1,6 @@
 # SoupaWhisper
 
-**SoupaWhisper** is a local voice dictation tool for Linux and designed for low resources machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
+**SoupaWhisper** is a local voice dictation tool for **Linux** and **macOS**, aimed at low-resource machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
 
 Target workflow (streaming mode) is:
 - press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence (even most sophisticated speech recognition systems can't handle URLs, email addresses, names, etc.),
@@ -21,10 +21,19 @@ Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU supp
 
 - **Python 3.10+**
 - **Poetry** or **uv**
-- **Linux with X11** (for `xclip`, `xdotool`, notifications)
-- **[PyAudio](https://people.csail.mit.edu/hubert/pyaudio/)** (system packages below)
+- **[PyAudio](https://people.csail.mit.edu/hubert/pyaudio/)** — on Linux, install PortAudio via your distro (see table below). On macOS, wheels usually suffice; if `pip` fails to build PyAudio, install PortAudio with Homebrew: `brew install portaudio`.
 
-### System dependencies by distro
+### Linux
+
+- **X11** (for `xclip`, `xdotool`, notifications on typical setups)
+
+### macOS
+
+- Clipboard and typing use **pbcopy** / **AppleScript** (no X11).
+- **Global hotkeys** need **Accessibility** permission for the app that runs SoupaWhisper (e.g. Terminal or iTerm). Function keys (F10, F12, …) are matched correctly on macOS (virtual key codes vs. `Key.f10` style symbols).
+- **launchd** user **LaunchAgent** is optional (`./install.sh` or `make service-reinstall`); background services **cannot** receive global hotkeys on macOS — use a **foreground** Terminal session for dictation. Use **`--test-keys`** to confirm the configured hotkey is seen (`[MATCH]` when you press it).
+
+### System dependencies by distro (Linux)
 
 | Distro | Install command |
 |--------|-----------------|
@@ -38,13 +47,13 @@ Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU supp
 ## Installation
 
 ```bash
-git clone https://github.com/ksred/soupawhisper.git
-cd soupawhisper
+git clone https://github.com/AlexanderMakarov/soupawhisper-streaming.git
+cd soupawhisper-streaming
 chmod +x install.sh
 ./install.sh
 ```
 
-The installer will detect your package manager, install system and Python dependencies (Poetry or uv), create the config file, and optionally install a systemd user service.
+The installer supports **Linux** and **macOS**. On Linux it uses your package manager for system libraries; on macOS it skips that step. It installs Python dependencies (Poetry or uv), creates the config file, and can install a user service — **systemd** on Linux or **launchd** (LaunchAgent) on macOS.
 
 ### Manual setup
 
@@ -139,28 +148,38 @@ Add `--streaming` or `--no-streaming` to override config. Use `--verbose` to lis
 
 ---
 
-## Run as a systemd service
+## Run as a background service
 
-If you didn’t enable it during install:
+You can run SoupaWhisper as a **user service** so it starts at login: **systemd** on Linux, **launchd** on macOS. The same `make service-*` targets work on both; they call `systemctl` or `launchctl` as appropriate.
+
+If you didn’t enable the service during install:
 
 ```bash
-./install.sh   # choose 'y' for systemd
+./install.sh   # choose 'y' when prompted (systemd on Linux, LaunchAgent on macOS)
 ```
 
-Or reinstall only the service (deps already installed):
+Or reinstall only the service (Python deps already installed):
 
 ```bash
 make service-reinstall
 ```
 
-**Service commands:**
+**Service commands** (Linux → `systemctl`; macOS → LaunchAgent at `~/Library/LaunchAgents/com.soupawhisper.dictate.plist`, logs at `~/Library/Logs/soupawhisper.log`):
 
 ```bash
-make service-start    # or systemctl --user start soupawhisper
-make service-stop     # or systemctl --user stop soupawhisper
-make service-restart  # or systemctl --user restart soupawhisper
-make service-status   # or systemctl --user status soupawhisper
-make service-logs     # or journalctl --user -u soupawhisper -f
+make service-start
+make service-stop
+make service-restart
+make service-status
+make service-logs     # Linux: journalctl; macOS: tail -f ~/Library/Logs/soupawhisper.log
+```
+
+**Linux (manual systemd):**
+
+```bash
+systemctl --user start soupawhisper
+systemctl --user stop soupawhisper
+journalctl --user -u soupawhisper -f
 ```
 
 ---
@@ -272,6 +291,7 @@ uv run pytest dictate_tests.py
 - [x] PyAudio for all recordings (no `arecord` dependency).
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
 - [x] Multiple languages support.
+- [x] **macOS:** launchd LaunchAgent, Makefile `service-*` targets, `--test-keys` / Accessibility docs, function-key matching for hotkeys ([PR #3](https://github.com/AlexanderMakarov/soupawhisper-streaming/pull/3)).
 - [ ] Support list of custom terms or pronunciation features (like accents or speech patterns).
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
