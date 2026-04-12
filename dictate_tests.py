@@ -47,6 +47,14 @@ class MockWhisperModel:
         self.compute_type = compute_type
         self.transcribe_calls = []
         self.transcribe = MagicMock(side_effect=self._transcribe_impl)
+
+    def detect_language(self, audio_path, **kwargs):
+        """Stub: Spanish first, then English — used to test language_allowlist."""
+        return (
+            "es",
+            0.9,
+            [("es", 0.5), ("en", 0.4), ("ru", 0.05)],
+        )
     
     def _transcribe_impl(self, audio_path, **kwargs):
         """Mock transcribe that records calls and returns test data."""
@@ -261,6 +269,48 @@ class TestDictation:
         mock_config.write_text(content.replace("compute_type = int8", "compute_type = int8\nlanguage = auto"))
         config = dictate.load_config()
         assert config["language"] is None
+
+    def test_language_allowlist_parsed(self, mock_config):
+        content = mock_config.read_text()
+        mock_config.write_text(
+            content.replace(
+                "compute_type = int8",
+                "compute_type = int8\nlanguage = auto\nlanguage_allowlist = en, ru",
+            )
+        )
+        config = dictate.load_config()
+        assert config["language"] is None
+        assert config["language_allowlist"] == ["en", "ru"]
+
+    def test_resolve_transcription_language_allowlist_picks_best_of_two(self):
+        model = MockWhisperModel()
+        audio = np.zeros(1600, dtype=np.float32)
+        # Whisper "top" is es, but allowlist is en,ru -> should pick ru (0.05) vs ... wait
+        # filtered: en 0.4, ru 0.05 -> max is en
+        assert (
+            dictate.resolve_transcription_language(
+                model, audio, None, ["en", "ru"]
+            )
+            == "en"
+        )
+
+    def test_resolve_transcription_language_fixed_skips_allowlist(self):
+        model = MockWhisperModel()
+        audio = np.zeros(1600, dtype=np.float32)
+        assert (
+            dictate.resolve_transcription_language(
+                model, audio, "ru", ["en", "ru"]
+            )
+            == "ru"
+        )
+
+    def test_resolve_transcription_language_single_allowlist_no_detect_call(self):
+        """One candidate needs no detect_language (same as fixed language)."""
+        model = MagicMock()
+        model.detect_language = MagicMock()
+        audio = np.zeros(1600, dtype=np.float32)
+        assert dictate.resolve_transcription_language(model, audio, None, ["ru"]) == "ru"
+        model.detect_language.assert_not_called()
 
     def test_config_clipboard_disabled(self, mock_config):
         """Test that clipboard=false is correctly loaded."""

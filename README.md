@@ -96,6 +96,19 @@ model = base
 language = auto
 ```
 
+**English and Russian only** (auto-detect, but never Hindi, German, etc.): with `language = auto`, Whisper can mis-guess the language on very short or noisy audio (for example while filling subscription fields). Restrict detection to a small set:
+
+```ini
+[whisper]
+model = base
+language = auto
+language_allowlist = en, ru
+```
+
+SoupaWhisper runs language detection once per utterance, keeps only the languages you list, and transcribes using the highest-scoring one among them—so output stays in Latin or Cyrillic from those two choices instead of drifting into another language.
+
+**Does this add a “second heavy” model pass?** Whisper’s CTranslate2 backend does not let you restrict the language classifier to a subset of ISO codes; it always produces scores for every language token. We reuse that same vector and only **filter** it to your allowlist—there is no lighter instruction path inside the model. The expensive step is the **text decoder** (autoregressive), and that still runs **once** per chunk. The extra work for `en, ru` is one **encoder + language head** pass via `detect_language`, which is small next to decoding. If you only need **one** language, set `language = ru` (or put a single code in `language_allowlist`) so detection is skipped entirely.
+
 **Spanish or other languages** forced to one language: same pattern as Russian — `language = es` (etc.) and a non-`*.en` `model`.
 
 ### GPU support (optional)
