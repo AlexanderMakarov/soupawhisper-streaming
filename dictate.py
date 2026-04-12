@@ -38,6 +38,59 @@ _STREAMING_VAD_PARAMETERS = {
     "speech_pad_ms": 200,
 }
 
+
+def resolve_transcription_language(
+    model,
+    audio_float32: np.ndarray,
+    language: Optional[str],
+    language_allowlist: Optional[list[str]],
+) -> Optional[str]:
+    """
+    Pick the language argument for WhisperModel.transcribe().
+
+    - Fixed language (en, ru, …): returned as-is.
+    - Auto (language is None) with no allowlist: None → Whisper does full multilingual detection.
+    - Auto with allowlist of **one** code: use that language without calling detect_language
+      (same as setting ``language`` explicitly; no extra encoder pass).
+    - Auto with allowlist of **two or more**: run ``detect_language`` once, then pick the
+      allowlisted language with the highest probability. CTranslate2 does not expose a way to
+      “decode only from these languages”; the model always scores all language tokens. We only
+      **filter** those scores to your list. Cost is one encoder forward + language head (the
+      heavy work is the autoregressive decoder, which still runs once per ``transcribe``).
+    """
+    if language is not None:
+        return language
+    if not language_allowlist:
+        return None
+    if len(language_allowlist) == 1:
+        return language_allowlist[0]
+    try:
+        _, _, all_probs = model.detect_language(
+            audio_float32,
+            vad_filter=False,
+            language_detection_segments=1,
+        )
+    except Exception as e:
+        logger.warning(
+            "language_allowlist: detect_language failed (%s); using %s",
+            e,
+            language_allowlist[0],
+        )
+        return language_allowlist[0]
+    allowed = frozenset(language_allowlist)
+    filtered = [(lang, p) for lang, p in all_probs if lang in allowed]
+    if filtered:
+        chosen = max(filtered, key=lambda x: x[1])[0]
+        logger.debug("language_allowlist: chose %s (candidates %s)", chosen, allowed)
+        return chosen
+    logger.debug(
+        "language_allowlist: no scores for %s; defaulting to %s",
+        allowed,
+        language_allowlist[0],
+    )
+    return language_allowlist[0]
+
+
 def _streaming_segments_to_text(segments: Iterable[Segment]) -> str:
     parts: list[str] = []
     for seg in segments:
@@ -62,12 +115,24 @@ def load_config():
     language_raw = config.get("whisper", "language", fallback="en").strip().lower()
     language = None if language_raw in {"auto", "none"} else (language_raw or "en")
 
+    allow_raw = config.get("whisper", "language_allowlist", fallback="").strip()
+    language_allowlist: Optional[list[str]] = None
+    if allow_raw:
+        language_allowlist = [
+            code.strip().lower()
+            for code in allow_raw.replace(",", " ").split()
+            if code.strip()
+        ]
+        if not language_allowlist:
+            language_allowlist = None
+
     return {
         # Whisper
         "model": config.get("whisper", "model", fallback="base.en"),
         "device": config.get("whisper", "device", fallback="cpu"),
         "compute_type": config.get("whisper", "compute_type", fallback="int8"),
         "language": language,
+        "language_allowlist": language_allowlist,
         # Input device
         "audio_input_device": config.get("input", "audio_input_device", fallback=None),
         # Hotkey
@@ -443,11 +508,16 @@ class Dictation:
         # Convert int16 to float32 and normalize to [-1.0, 1.0]
         if audio_array.dtype == np.int16:
             audio_array = audio_array.astype(np.float32) / 32768.0
-        # Transcribe audio.
+        lang = resolve_transcription_language(
+            self.model,
+            audio_array,
+            self.config.get("language"),
+            self.config.get("language_allowlist"),
+        )
         segments, info = self.model.transcribe(
             audio_array,
             vad_filter=True,
-            language=self.config.get("language"),
+            language=lang,
         )
         # Convert segments to text.
         text = self._segments_to_text(segments, self.config["auto_sentence"])
@@ -860,6 +930,12 @@ class StreamingDictation(Dictation):
                     segment = segment.astype(np.float32) / 32768.0
                 # Note: transcribe() returns an iterator; iteration runs the decoder.
                 trans_start = time.monotonic()
+                lang = resolve_transcription_language(
+                    self.model,
+                    segment,
+                    self.config.get("language"),
+                    self.config.get("language_allowlist"),
+                )
                 segments, _ = self.model.transcribe(
                     segment,
                     # Second VAD pass with options tuned for short clips (see _STREAMING_VAD_PARAMETERS).
@@ -868,7 +944,7 @@ class StreamingDictation(Dictation):
                     # FYI: don't set temperature=0.0, it will cause errors like
                     # "Log probability threshold is not met with temperature 0.0 (-1.359611 < -1.000000)"
                     # temperature=0.0,
-                    language=self.config.get("language"),
+                    language=lang,
                     condition_on_previous_text=True,
                     without_timestamps=True,
                 )
