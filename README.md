@@ -107,6 +107,71 @@ language_allowlist = en, ru
 
 SoupaWhisper runs language detection once per utterance, keeps only the languages you list, and transcribes using the highest-scoring one among them—so output stays in Latin or Cyrillic from those two choices instead of drifting into another language.
 
+**Optional: enforce auto-detect using current keyboard layout (best for `en, ru`)**: if you have `language = auto` + `language_allowlist = en, ru`, you can also tell SoupaWhisper to pick the language based on your **current OS keyboard layout/input source** (Latin vs Cyrillic). This language is captured **once when you start dictation** (hotkey press) and used for the whole dictation session (no re-checks mid-stream).
+
+```ini
+[behavior]
+enforce_language_from_layout = true
+layout_to_language = com.apple.keylayout.US:en, com.apple.keylayout.Russian:ru, us:en, ru:ru
+```
+
+#### How `layout_to_language` works
+
+- **Format**: comma-separated `<layout_id>:<iso639-1>` pairs (no spaces inside the id).
+- **Allowed values**: any two-letter ISO 639-1 codes Whisper supports (for example `en`, `ru`, `es`, `de`).
+- **Interaction with `language_allowlist`**: if `language_allowlist` is set, the enforced language must be included (otherwise the allowlist wins and normal detection is used).
+
+#### How to find the right `layout_id`
+
+- **macOS (recommended)**
+  - The app reads the current input source id from `com.apple.HIToolbox` (selected input sources).
+    Quick way to see the current `InputSourceID`:
+
+    ```bash
+    defaults export com.apple.HIToolbox - | python3 -c 'import sys, plistlib; d=plistlib.loads(sys.stdin.buffer.read()); sel=d.get("AppleSelectedInputSources") or []; print((sel[0] or {}).get("InputSourceID",""))'
+    ```
+  - Example outputs:
+    - `com.apple.keylayout.US`
+    - `com.apple.keylayout.Russian`
+    - `com.apple.keylayout.ABC`
+
+  Start with a minimal mapping:
+
+  ```ini
+  [behavior]
+  enforce_language_from_layout = true
+  layout_to_language = com.apple.keylayout.US:en, com.apple.keylayout.ABC:en, com.apple.keylayout.Russian:ru
+  ```
+
+  If you want to see which languages macOS associates with each input source (what SoupaWhisper uses as a fallback when no explicit mapping matches), run:
+
+  ```bash
+  defaults export com.apple.HIToolbox - | python3 -c '
+import sys, plistlib
+d = plistlib.loads(sys.stdin.buffer.read())
+items = (d.get("AppleSelectedInputSources") or []) + (d.get("AppleInputSourceHistory") or [])
+for it in items:
+    if isinstance(it, dict) and "InputSourceID" in it:
+        print(it.get("InputSourceID"), it.get("InputSourceLanguages"))
+'
+  ```
+
+- **Linux/X11**
+  - To reliably detect the **active** layout group, install one of:
+    - `xkb-switch`
+    - `xkblayout-state`
+  - Your `layout_id` values are typically short XKB tokens like `us`, `ru`, `de`.
+
+  Example mapping:
+
+  ```ini
+  [behavior]
+  enforce_language_from_layout = true
+  layout_to_language = us:en, ru:ru
+  ```
+
+  If you don’t have `xkb-switch` / `xkblayout-state`, this feature can’t reliably determine the active layout and will do nothing.
+
 **Does this add a “second heavy” model pass?** Whisper’s CTranslate2 backend does not let you restrict the language classifier to a subset of ISO codes; it always produces scores for every language token. We reuse that same vector and only **filter** it to your allowlist—there is no lighter instruction path inside the model. The expensive step is the **text decoder** (autoregressive), and that still runs **once** per chunk. The extra work for `en, ru` is one **encoder + language head** pass via `detect_language`, which is small next to decoding. If you only need **one** language, set `language = ru` (or put a single code in `language_allowlist`) so detection is skipped entirely.
 
 **Spanish or other languages** forced to one language: same pattern as Russian — `language = es` (etc.) and a non-`*.en` `model`.
