@@ -802,12 +802,19 @@ class Dictation:
         return text, info.duration
 
     def on_press(self, key):
-        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-            self.start_recording()
+        try:
+            if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self.start_recording()
+        except Exception as e:
+            # Never let an exception kill the pynput listener thread.
+            logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
 
     def on_release(self, key):
-        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-            self.stop_recording()
+        try:
+            if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self.stop_recording()
+        except Exception as e:
+            logger.error("[hotkey] on_release failed: %s", e, exc_info=True)
 
     def stop(self):
         logger.info("\nExiting...")
@@ -1015,11 +1022,14 @@ class StreamingDictation(Dictation):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
     def on_press(self, key):
-        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-            if not self.recording:
-                self.start_recording()
-            else:
-                self.stop_recording()
+        try:
+            if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                if not self.recording:
+                    self.start_recording()
+                else:
+                    self.stop_recording()
+        except Exception as e:
+            logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
 
     def run(self):
         with keyboard.Listener(
