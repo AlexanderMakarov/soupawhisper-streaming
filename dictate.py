@@ -490,6 +490,7 @@ class Dictation:
             self.config.get("layout_to_language", "")
         )
         self._session_enforced_language: Optional[str] = None
+        self._hotkey_action_lock = threading.Lock()
 
         if self.config["auto_type"]:
             self.typer = Typer(
@@ -804,7 +805,7 @@ class Dictation:
     def on_press(self, key):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-                self.start_recording()
+                self._schedule_hotkey_action(self.start_recording, "start_recording")
         except Exception as e:
             # Never let an exception kill the pynput listener thread.
             logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
@@ -812,9 +813,30 @@ class Dictation:
     def on_release(self, key):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-                self.stop_recording()
+                self._schedule_hotkey_action(self.stop_recording, "stop_recording")
         except Exception as e:
             logger.error("[hotkey] on_release failed: %s", e, exc_info=True)
+
+    def _schedule_hotkey_action(self, fn, name: str) -> None:
+        """
+        Run hotkey actions (start/stop) off the pynput callback thread.
+
+        This prevents long operations (thread joins, IO) from blocking key processing and
+        making the app appear to "stop reacting" after quick toggles.
+        """
+
+        def runner():
+            if not self._hotkey_action_lock.acquire(blocking=False):
+                logger.debug("[hotkey] action %s skipped (another in progress)", name)
+                return
+            try:
+                fn()
+            except Exception as e:
+                logger.error("[hotkey] action %s failed: %s", name, e, exc_info=True)
+            finally:
+                self._hotkey_action_lock.release()
+
+        threading.Thread(target=runner, daemon=True, name=f"hotkey_{name}").start()
 
     def stop(self):
         logger.info("\nExiting...")
@@ -1025,9 +1047,9 @@ class StreamingDictation(Dictation):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
                 if not self.recording:
-                    self.start_recording()
+                    self._schedule_hotkey_action(self.start_recording, "start_recording")
                 else:
-                    self.stop_recording()
+                    self._schedule_hotkey_action(self.stop_recording, "stop_recording")
         except Exception as e:
             logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
 
