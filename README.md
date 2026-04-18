@@ -15,6 +15,8 @@ It increases your words-per-minute speed in 3-4 times, from ~40 WPM to ~150 WPM.
 
 Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU support for faster transcription.
 
+[![Watch the demo](https://img.youtube.com/vi/fRiqNzupudI/0.jpg)](https://youtu.be/fRiqNzupudI)
+
 ---
 
 ## Requirements
