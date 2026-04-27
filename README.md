@@ -217,6 +217,22 @@ Add `--streaming` or `--no-streaming` to override config. Use `--verbose` to lis
 - **Streaming:** press hotkey again to stop; text is emitted in chunks as silence is detected.
 - **Ctrl+C** quits when run in the foreground.
 
+### Streaming: reject specific noise phrases
+
+Whisper can sometimes output short “filler” phrases from noise (coughs, mic bumps, etc.). In **streaming mode only**, you can configure a list of phrases to suppress.
+
+- A chunk is skipped only if it **exactly equals** one configured phrase, ignoring punctuation (so `thank you`, `thank you.` and `THANK YOU!!!` are treated the same).
+- If the chunk contains **anything else** (multiple phrases, extra words), it is **not** rejected.
+- If `reject_phrases` is empty/unset, the feature is **disabled** and all chunks are emitted as-is.
+- When a chunk is skipped, SoupaWhisper logs an info line: `[reject] Skipping chunk (matched reject phrase): ...`
+
+Config example:
+
+```ini
+[behavior]
+reject_phrases = thank you, thanks, okay, ok, um, hmm
+```
+
 ### Modes
 
 | Mode | Flag / config | Best for |

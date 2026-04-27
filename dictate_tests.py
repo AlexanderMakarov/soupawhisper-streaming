@@ -215,6 +215,32 @@ class TestStreamingDictation:
         dictation.model_loaded.wait(timeout=1.0)
         assert isinstance(dictation, dictate.StreamingDictation)
 
+    def test_reject_phrases_normalization_ignores_punctuation(self):
+        assert dictate._normalize_reject_phrase(" um... ") == "um"
+        assert dictate._normalize_reject_phrase("Hmm..") == "hmm"
+        assert dictate._normalize_reject_phrase("THANK YOU!!!") == "thank you"
+
+    def test_reject_phrases_disabled_when_empty(self):
+        d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
+        d.config = {"reject_phrases": ""}
+        d._reject_phrase_set = d._build_reject_phrase_set()
+        assert d._reject_phrase_set == frozenset()
+        assert d._should_reject_streaming_chunk("thank you") is False
+
+    def test_reject_phrases_exact_whole_chunk_match(self):
+        d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
+        d.config = {"reject_phrases": "thank you, um, hmm"}
+        d._reject_phrase_set = d._build_reject_phrase_set()
+
+        assert d._should_reject_streaming_chunk("thank you") is True
+        assert d._should_reject_streaming_chunk("Thank you!!!") is True
+        assert d._should_reject_streaming_chunk("um...") is True
+        assert d._should_reject_streaming_chunk("Hmm..") is True
+
+        # Multiple phrases / extra words must NOT be rejected.
+        assert d._should_reject_streaming_chunk("thank you thanks") is False
+        assert d._should_reject_streaming_chunk("um well") is False
+
 
 class TestDictation:
     """Tests for non-streaming Dictation class (backward compatibility)."""

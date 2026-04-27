@@ -14,6 +14,7 @@ import time
 import wave
 import logging
 import plistlib
+import string
 from pathlib import Path
 from typing import Optional, Iterable, Tuple
 from faster_whisper.transcribe import Segment
@@ -100,6 +101,21 @@ def _streaming_segments_to_text(segments: Iterable[Segment]) -> str:
             continue
         parts.append(text)
     return " ".join(parts).strip()
+
+_REJECT_PUNCT_TRANSLATION = str.maketrans("", "", string.punctuation)
+
+def _normalize_reject_phrase(text: str) -> str:
+    """
+    Normalize text for reject-phrase matching.
+
+    Rule: reject phrase matches the entire chunk ignoring punctuation.
+    Examples:
+      "Thank you" == "thank you." == "thank you!!!"
+    """
+    s = " ".join(text.lower().split())
+    if not s:
+        return ""
+    return s.translate(_REJECT_PUNCT_TRANSLATION).strip()
 
 
 # Load configuration
@@ -319,6 +335,9 @@ def load_config():
         "auto_sentence": config.getboolean("behavior", "auto_sentence", fallback=True),
         "typing_delay": config.getfloat("behavior", "typing_delay", fallback=0.01),
         "save_recordings": config.getboolean("behavior", "save_recordings", fallback=False),
+        # Streaming-only: comma-separated phrases to suppress if a chunk equals one of them
+        # (punctuation ignored). If empty, feature is disabled.
+        "reject_phrases": config.get("behavior", "reject_phrases", fallback="").strip(),
         # Language enforcement (optional): use current OS keyboard layout as the "field expectation"
         "enforce_language_from_layout": config.getboolean("behavior", "enforce_language_from_layout", fallback=False),
         # Comma-separated list: "<layout_id>:<lang>,<layout_id>:<lang>"
@@ -1147,6 +1166,28 @@ class StreamingDictation(Dictation):
         self.speech_end_time: float = 0.0
         self.accumulated_text = ""
         self._last_hotkey_event_monotonic: Optional[float] = None
+        self._reject_phrase_set = self._build_reject_phrase_set()
+
+    def _build_reject_phrase_set(self) -> frozenset[str]:
+        raw = (self.config.get("reject_phrases") or "").strip()
+        if not raw:
+            return frozenset()
+        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+        normalized = {_normalize_reject_phrase(p) for p in parts}
+        normalized.discard("")
+        return frozenset(normalized)
+
+    def _should_reject_streaming_chunk(self, text: str) -> bool:
+        """
+        Reject only if the *whole chunk* equals one configured phrase (punctuation ignored).
+        If reject_phrases is empty, feature is disabled and nothing is rejected.
+        """
+        if not self._reject_phrase_set:
+            return False
+        normalized = _normalize_reject_phrase(text)
+        if not normalized:
+            return False
+        return normalized in self._reject_phrase_set
 
     def _finish_model_loading(self):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
@@ -1448,6 +1489,9 @@ class StreamingDictation(Dictation):
                 trans_duration = time.monotonic() - trans_start
                 if not text:
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
+                    continue
+                if self._should_reject_streaming_chunk(text):
+                    logger.info("[reject] Skipping chunk (matched reject phrase): %r", text)
                     continue
                 else:
                     logger.info(f"[transcriber] Transcribed {len(segment) / float(self.vad_sample_rate):.2f}s in {trans_duration:.2f}s: {text}")
