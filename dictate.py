@@ -101,6 +101,7 @@ def _streaming_segments_to_text(segments: Iterable[Segment]) -> str:
         parts.append(text)
     return " ".join(parts).strip()
 
+
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
 DEFAULT_HOTKEY = "f12"
@@ -491,6 +492,9 @@ class Dictation:
         )
         self._session_enforced_language: Optional[str] = None
         self._hotkey_action_lock = threading.Lock()
+        self._last_hotkey_event_monotonic: Optional[float] = None
+        self._hotkey_action_in_progress_since: Optional[float] = None
+        self._hotkey_action_in_progress_name: Optional[str] = None
 
         if self.config["auto_type"]:
             self.typer = Typer(
@@ -805,6 +809,7 @@ class Dictation:
     def on_press(self, key):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self._last_hotkey_event_monotonic = time.monotonic()
                 self._schedule_hotkey_action(self.start_recording, "start_recording")
         except Exception as e:
             # Never let an exception kill the pynput listener thread.
@@ -813,6 +818,7 @@ class Dictation:
     def on_release(self, key):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self._last_hotkey_event_monotonic = time.monotonic()
                 self._schedule_hotkey_action(self.stop_recording, "stop_recording")
         except Exception as e:
             logger.error("[hotkey] on_release failed: %s", e, exc_info=True)
@@ -827,13 +833,44 @@ class Dictation:
 
         def runner():
             if not self._hotkey_action_lock.acquire(blocking=False):
-                logger.debug("[hotkey] action %s skipped (another in progress)", name)
+                held_s = None
+                if self._hotkey_action_in_progress_since is not None:
+                    held_s = time.monotonic() - self._hotkey_action_in_progress_since
+                logger.warning(
+                    "[hotkey] action %s skipped (in progress=%s held_s=%s)",
+                    name,
+                    self._hotkey_action_in_progress_name or "unknown",
+                    f"{held_s:.2f}" if held_s is not None else "unknown",
+                )
+                # If we get stuck holding the hotkey action lock, we become permanently unresponsive.
+                # In that case, prefer a clean restart under launchd KeepAlive.
+                if held_s is not None and held_s > 10.0:
+                    logger.critical(
+                        "[hotkey] action lock stuck for %.2fs (in_progress=%s). Exiting for launchd restart.",
+                        held_s,
+                        self._hotkey_action_in_progress_name,
+                    )
+                    try:
+                        if self.config.get("notifications"):
+                            self.notify(
+                                "SoupaWhisper stalled",
+                                "Hotkey actions got stuck; restarting the service to recover.",
+                                logging.ERROR,
+                                5000,
+                                "dialog-error",
+                            )
+                    finally:
+                        os._exit(1)
                 return
             try:
+                self._hotkey_action_in_progress_since = time.monotonic()
+                self._hotkey_action_in_progress_name = name
                 fn()
             except Exception as e:
                 logger.error("[hotkey] action %s failed: %s", name, e, exc_info=True)
             finally:
+                self._hotkey_action_in_progress_since = None
+                self._hotkey_action_in_progress_name = None
                 self._hotkey_action_lock.release()
 
         threading.Thread(target=runner, daemon=True, name=f"hotkey_{name}").start()
@@ -846,12 +883,82 @@ class Dictation:
             self._keyboard_listener.stop()
 
     def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release,
-        ) as listener:
+        def start_listener() -> keyboard.Listener:
+            listener = keyboard.Listener(
+                on_press=self.on_press,
+                on_release=self.on_release,
+            )
+            listener.daemon = True
+            listener.start()
             self._keyboard_listener = listener
-            listener.join()
+            return listener
+
+        if self.config.get("notifications"):
+            self.notify(
+                "SoupaWhisper running",
+                f"Hold {self.get_hotkey_name().upper()} to record, release to transcribe.",
+                logging.INFO,
+                1500,
+                "dialog-information",
+            )
+
+        try:
+            listener = start_listener()
+        except Exception as e:
+            exe = sys.executable
+            logger.error("[hotkey] Failed to start keyboard listener: %s", e, exc_info=True)
+            if self.config.get("notifications"):
+                self.notify(
+                    "Hotkey listener failed",
+                    "SoupaWhisper could not listen for global hotkeys.\n\n"
+                    "On macOS, this usually means missing Accessibility / Input Monitoring permission "
+                    f"for the running executable:\n{exe}",
+                    logging.ERROR,
+                    10000,
+                    "dialog-error",
+                )
+            raise
+
+        last_heartbeat = 0.0
+        restart_backoff_s = 1.0
+        while self.running:
+            time.sleep(0.2)
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                last_heartbeat = now
+                last_hotkey_age = None
+                if self._last_hotkey_event_monotonic is not None:
+                    last_hotkey_age = now - self._last_hotkey_event_monotonic
+
+            # If listener stops unexpectedly, restart and log loudly.
+            if getattr(listener, "running", True) is False:
+                try:
+                    # Best-effort stop old listener (may already be stopped).
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                    time.sleep(restart_backoff_s)
+                    listener = start_listener()
+                    restart_backoff_s = 1.0
+                except Exception as e:
+                    restart_backoff_s = min(30.0, restart_backoff_s * 2.0)
+                    logger.error("[hotkey] Listener restart failed: %s", e, exc_info=True)
+                    if self.config.get("notifications"):
+                        self.notify(
+                            "Hotkey listener stopped",
+                            "SoupaWhisper stopped receiving hotkeys and could not restart.\n\n"
+                            f"Executable: {sys.executable}\n\n"
+                            "If this keeps happening on macOS, re-check Accessibility / Input Monitoring permissions.",
+                            logging.ERROR,
+                            10000,
+                            "dialog-error",
+                        )
+
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
     def _audio_recording_worker(self):
         """Audio recording worker thread that collects audio data into one array."""
@@ -1039,6 +1146,7 @@ class StreamingDictation(Dictation):
         self.speech_silence_duration: float = 0.0
         self.speech_end_time: float = 0.0
         self.accumulated_text = ""
+        self._last_hotkey_event_monotonic: Optional[float] = None
 
     def _finish_model_loading(self):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
@@ -1046,6 +1154,7 @@ class StreamingDictation(Dictation):
     def on_press(self, key):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self._last_hotkey_event_monotonic = time.monotonic()
                 if not self.recording:
                     self._schedule_hotkey_action(self.start_recording, "start_recording")
                 else:
@@ -1054,11 +1163,77 @@ class StreamingDictation(Dictation):
             logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
 
     def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press
-        ) as listener:
+        def start_listener() -> keyboard.Listener:
+            listener = keyboard.Listener(on_press=self.on_press)
+            listener.daemon = True
+            listener.start()
             self._keyboard_listener = listener
-            listener.join()
+            return listener
+
+        if self.config.get("notifications"):
+            self.notify(
+                "SoupaWhisper running",
+                f"Press {self.get_hotkey_name().upper()} to start/stop streaming transcription.",
+                logging.INFO,
+                1500,
+                "dialog-information",
+            )
+
+        try:
+            listener = start_listener()
+        except Exception as e:
+            exe = sys.executable
+            logger.error("[hotkey] Failed to start keyboard listener: %s", e, exc_info=True)
+            if self.config.get("notifications"):
+                self.notify(
+                    "Hotkey listener failed",
+                    "SoupaWhisper could not listen for global hotkeys.\n\n"
+                    "On macOS, this usually means missing Accessibility / Input Monitoring permission "
+                    f"for the running executable:\n{exe}",
+                    logging.ERROR,
+                    10000,
+                    "dialog-error",
+                )
+            raise
+
+        last_heartbeat = 0.0
+        restart_backoff_s = 1.0
+        while self.running:
+            time.sleep(0.2)
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                last_heartbeat = now
+                last_hotkey_age = None
+                if self._last_hotkey_event_monotonic is not None:
+                    last_hotkey_age = now - self._last_hotkey_event_monotonic
+
+            if getattr(listener, "running", True) is False:
+                try:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                    time.sleep(restart_backoff_s)
+                    listener = start_listener()
+                    restart_backoff_s = 1.0
+                except Exception as e:
+                    restart_backoff_s = min(30.0, restart_backoff_s * 2.0)
+                    logger.error("[hotkey] Listener restart failed: %s", e, exc_info=True)
+                    if self.config.get("notifications"):
+                        self.notify(
+                            "Hotkey listener stopped",
+                            "SoupaWhisper stopped receiving hotkeys and could not restart.\n\n"
+                            f"Executable: {sys.executable}\n\n"
+                            "If this keeps happening on macOS, re-check Accessibility / Input Monitoring permissions.",
+                            logging.ERROR,
+                            10000,
+                            "dialog-error",
+                        )
+
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
     def start_recording(self):
         if self.recording:
@@ -1541,34 +1716,8 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
         metavar="WAV_FILE",
         help="Transcribe provided WAV file and exit"
     )
-    parser.add_argument(
-        "--test-keys",
-        action="store_true",
-        help="Listen and print key events (for hotkey troubleshooting). Press Ctrl+C to exit."
-    )
     args = parser.parse_args()
     check_dependencies(config)
-
-    # Test keys mode: print every key press and whether it matches configured hotkey.
-    if args.test_keys:
-        config = load_config()
-        hotkey = get_hotkey(config["key"])
-        hotkey_value = getattr(hotkey, "value", None)
-        hotkey_vk = getattr(hotkey_value, "vk", None) if hotkey_value else getattr(hotkey, "vk", None)
-        hotkey_name = getattr(hotkey, "name", None) or getattr(hotkey, "char", config["key"])
-        print(f"Configured hotkey: {hotkey_name} (value={hotkey_value}, vk={hotkey_vk})")
-        print("Press keys (e.g. F10). Matching key will show [MATCH]. Ctrl+C to exit.\n")
-        def on_press(key):
-            try:
-                name = getattr(key, "name", None) or getattr(key, "char", repr(key))
-                vk = getattr(key, "vk", None)
-            except Exception:
-                name, vk = repr(key), None
-            match = keys_match(key, hotkey, hotkey_value, hotkey_vk)
-            print(f"  Key: {name} vk={vk}  {'[MATCH]' if match else ''}")
-        with keyboard.Listener(on_press=on_press) as listener:
-            listener.join()
-        return
 
     # Apply arguments.
     if args.verbose:
