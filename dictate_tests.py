@@ -8,6 +8,7 @@ import numpy as np
 import queue
 from unittest.mock import MagicMock, patch
 from typing import Any
+from types import SimpleNamespace
 
 # Add 2 second timeout to all tests to prevent infinite loops
 pytestmark = pytest.mark.timeout(2)
@@ -80,7 +81,7 @@ class MockWhisperModel:
                 tokens=[], avg_logprob=0.0, compression_ratio=0.0,
                 no_speech_prob=0.0, words=None, temperature=None
             )
-            return [segment], {"language": "en"}
+            return [segment], SimpleNamespace(duration=1.0)
 
 
 @pytest.fixture
@@ -214,6 +215,32 @@ class TestStreamingDictation:
         dictation.model_loaded.wait(timeout=1.0)
         assert isinstance(dictation, dictate.StreamingDictation)
 
+    def test_reject_phrases_normalization_ignores_punctuation(self):
+        assert dictate._normalize_reject_phrase(" um... ") == "um"
+        assert dictate._normalize_reject_phrase("Hmm..") == "hmm"
+        assert dictate._normalize_reject_phrase("THANK YOU!!!") == "thank you"
+
+    def test_reject_phrases_disabled_when_empty(self):
+        d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
+        d.config = {"reject_phrases": ""}
+        d._reject_phrase_set = d._build_reject_phrase_set()
+        assert d._reject_phrase_set == frozenset()
+        assert d._should_reject_streaming_chunk("thank you") is False
+
+    def test_reject_phrases_exact_whole_chunk_match(self):
+        d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
+        d.config = {"reject_phrases": "thank you, um, hmm"}
+        d._reject_phrase_set = d._build_reject_phrase_set()
+
+        assert d._should_reject_streaming_chunk("thank you") is True
+        assert d._should_reject_streaming_chunk("Thank you!!!") is True
+        assert d._should_reject_streaming_chunk("um...") is True
+        assert d._should_reject_streaming_chunk("Hmm..") is True
+
+        # Multiple phrases / extra words must NOT be rejected.
+        assert d._should_reject_streaming_chunk("thank you thanks") is False
+        assert d._should_reject_streaming_chunk("um well") is False
+
 
 class TestDictation:
     """Tests for non-streaming Dictation class (backward compatibility)."""
@@ -311,6 +338,93 @@ class TestDictation:
         audio = np.zeros(1600, dtype=np.float32)
         assert dictate.resolve_transcription_language(model, audio, None, ["ru"]) == "ru"
         model.detect_language.assert_not_called()
+
+    def test_layout_language_map_parsing(self):
+        parsed = dictate.Dictation._parse_layout_to_language_map(
+            "com.apple.keylayout.US:en, com.apple.keylayout.Russian:ru, xkb:de:de"
+        )
+        assert parsed["com.apple.keylayout.US"] == "en"
+        assert parsed["com.apple.keylayout.Russian"] == "ru"
+        assert parsed["xkb"] == "de:de"
+
+    def test_language_from_layout_direct_and_heuristic(self):
+        m = {"com.apple.keylayout.US": "en"}
+        assert dictate.language_from_layout("com.apple.keylayout.US", m) == "en"
+        assert dictate.language_from_layout("com.apple.keylayout.Russian", {}) is None
+
+    def test_enforce_language_from_layout_overrides_auto(self, mock_config, monkeypatch):
+        # Set auto language + allowlist.
+        content = mock_config.read_text()
+        content = content.replace(
+            "compute_type = int8",
+            "compute_type = int8\nlanguage = auto\nlanguage_allowlist = en, ru",
+        )
+        # Inject behavior keys into the existing [behavior] section.
+        content = content.replace(
+            "clipboard = true",
+            "clipboard = true\n"
+            "enforce_language_from_layout = true\n"
+            "layout_to_language = com.apple.keylayout.Russian:ru",
+        )
+        mock_config.write_text(content)
+        config = dictate.load_config()
+        # Pretend we're on macOS to avoid xdotool usage.
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        # Force detector to return Russian layout.
+        monkeypatch.setattr(dictate, "detect_current_keyboard_layout", lambda: "com.apple.keylayout.Russian")
+        # Avoid depending on real HIToolbox parsing in tests.
+        monkeypatch.setattr(dictate, "_macos_input_source_languages_for_id", lambda _id: ["ru"])
+
+        d = dictate.Dictation(config)
+        # Don't wait for real model thread; stub model directly.
+        model = MockWhisperModel()
+        d.model = model
+        d.model_error = None
+        d.model_loaded.set()
+
+        # Mimic "hotkey pressed" behavior (capture once at session start).
+        d._capture_session_enforced_language()
+
+        audio = np.zeros(1600, dtype=np.int16)
+        d._transcribe_audio_array(audio)
+        # Ensure transcribe was called with language="ru".
+        _, kwargs = model.transcribe_calls[-1]
+        assert kwargs.get("language") == "ru"
+
+    def test_detect_current_keyboard_language_macos_uses_input_source_languages(self, monkeypatch):
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        # Match the real-world structure: AppleCurrentKeyboardLayoutInputSourceID exists, while
+        # AppleSelectedInputSources entries may not contain InputSourceID or InputSourceLanguages.
+        monkeypatch.setattr(
+            dictate,
+            "_macos_hitoolbox_plist",
+            lambda: {
+                "AppleCurrentKeyboardLayoutInputSourceID": "com.apple.keylayout.ABC",
+                "AppleSelectedInputSources": [
+                    {"Bundle ID": "com.apple.PressAndHold", "InputSourceKind": "Non Keyboard Input Method"},
+                    {"InputSourceKind": "Keyboard Layout", "KeyboardLayout ID": 252, "KeyboardLayout Name": "ABC"},
+                ],
+            },
+        )
+        # We still expect language detection to use _macos_input_source_languages_for_id fallback
+        # when no explicit mapping exists.
+        monkeypatch.setattr(dictate, "_macos_input_source_languages_for_id", lambda _id: ["en"])
+        assert dictate.detect_current_keyboard_language({}) == "en"
+
+    def test_detect_current_keyboard_layout_macos_uses_current_layout_id(self, monkeypatch):
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        monkeypatch.setattr(
+            dictate,
+            "_macos_hitoolbox_plist",
+            lambda: {
+                "AppleCurrentKeyboardLayoutInputSourceID": "com.apple.keylayout.ABC",
+                "AppleSelectedInputSources": [
+                    {"Bundle ID": "com.apple.PressAndHold", "InputSourceKind": "Non Keyboard Input Method"},
+                    {"InputSourceKind": "Keyboard Layout", "KeyboardLayout ID": 252, "KeyboardLayout Name": "ABC"},
+                ],
+            },
+        )
+        assert dictate.detect_current_keyboard_layout() == "com.apple.keylayout.ABC"
 
     def test_config_clipboard_disabled(self, mock_config):
         """Test that clipboard=false is correctly loaded."""

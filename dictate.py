@@ -13,6 +13,8 @@ import queue
 import time
 import wave
 import logging
+import plistlib
+import string
 from pathlib import Path
 from typing import Optional, Iterable, Tuple
 from faster_whisper.transcribe import Segment
@@ -100,10 +102,198 @@ def _streaming_segments_to_text(segments: Iterable[Segment]) -> str:
         parts.append(text)
     return " ".join(parts).strip()
 
+_REJECT_PUNCT_TRANSLATION = str.maketrans("", "", string.punctuation)
+
+def _normalize_reject_phrase(text: str) -> str:
+    """
+    Normalize text for reject-phrase matching.
+
+    Rule: reject phrase matches the entire chunk ignoring punctuation.
+    Examples:
+      "Thank you" == "thank you." == "thank you!!!"
+    """
+    s = " ".join(text.lower().split())
+    if not s:
+        return ""
+    return s.translate(_REJECT_PUNCT_TRANSLATION).strip()
+
+
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
 DEFAULT_HOTKEY = "f12"
 IS_MACOS = platform.system() == "Darwin"
+
+
+def _run_cmd(cmd: list[str], timeout_s: float = 0.8) -> Optional[str]:
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    out = (res.stdout or "").strip()
+    return out or None
+
+
+def detect_current_keyboard_layout() -> Optional[str]:
+    """
+    Best-effort OS keyboard layout / input source identifier.
+
+    Returns:
+      - macOS: InputSourceID (e.g. "com.apple.keylayout.US", "com.apple.keylayout.Russian")
+      - Linux/X11: xkb layout string from `setxkbmap -query` (e.g. "us", "ru", "us,ru")
+    """
+    if IS_MACOS:
+        # Prefer HIToolbox current-layout id (exists on many systems; see README for example).
+        data = _macos_hitoolbox_plist()
+        if isinstance(data, dict):
+            current_id = data.get("AppleCurrentKeyboardLayoutInputSourceID")
+            if isinstance(current_id, str) and current_id.strip():
+                return current_id.strip()
+
+            # Fallback: selected input sources may not carry InputSourceID (often only name/id),
+            # but in some setups it does.
+            selected = data.get("AppleSelectedInputSources")
+            if isinstance(selected, list) and selected:
+                first = selected[0]
+                if isinstance(first, dict):
+                    src_id = first.get("InputSourceID")
+                    if isinstance(src_id, str) and src_id.strip():
+                        return src_id.strip()
+
+        # Fallbacks (may be missing on some systems).
+        for cmd in (
+            ["defaults", "read", "-g", "AppleCurrentKeyboardLayoutInputSourceID"],
+            [
+                "defaults",
+                "read",
+                str(Path.home() / "Library" / "Preferences" / "com.apple.HIToolbox.plist"),
+                "AppleCurrentKeyboardLayoutInputSourceID",
+            ],
+        ):
+            out = _run_cmd(cmd)
+            if out:
+                return out
+        return None
+
+    # Linux (X11): prefer setxkbmap if present.
+    if subprocess.run(["which", "setxkbmap"], capture_output=True).returncode == 0:
+        out = _run_cmd(["setxkbmap", "-query"], timeout_s=0.8)
+        if not out:
+            return None
+        for line in out.splitlines():
+            if line.strip().startswith("layout:"):
+                return line.split("layout:", 1)[1].strip() or None
+    return None
+
+
+def _macos_hitoolbox_plist() -> Optional[dict]:
+    """
+    Parse com.apple.HIToolbox preferences as a plist.
+
+    We use `defaults export` so we get a structured plist (XML), not an ambiguous human string.
+    """
+    out = _run_cmd(["defaults", "export", "com.apple.HIToolbox", "-"], timeout_s=1.2)
+    if not out:
+        return None
+    try:
+        return plistlib.loads(out.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _macos_input_source_languages_for_id(input_source_id: str) -> Optional[list[str]]:
+    """
+    Given a macOS InputSourceID, return its InputSourceLanguages (ISO codes) if available.
+    """
+    data = _macos_hitoolbox_plist()
+    if not data:
+        return None
+    # Keys observed in the wild: AppleSelectedInputSources, AppleInputSourceHistory.
+    candidates = []
+    for k in ("AppleSelectedInputSources", "AppleInputSourceHistory"):
+        v = data.get(k)
+        if isinstance(v, list):
+            candidates.extend([x for x in v if isinstance(x, dict)])
+    for entry in candidates:
+        if entry.get("InputSourceID") != input_source_id:
+            continue
+        langs = entry.get("InputSourceLanguages")
+        if isinstance(langs, list) and all(isinstance(x, str) for x in langs):
+            return langs
+    return None
+
+
+def _linux_active_xkb_layout() -> Optional[str]:
+    """
+    Try to detect the *active* XKB layout (current group), not just the configured list.
+
+    Returns a single layout token like "us" or "ru" when possible.
+    """
+    # Best: xkb-switch prints current layout (if installed).
+    if subprocess.run(["which", "xkb-switch"], capture_output=True).returncode == 0:
+        out = _run_cmd(["xkb-switch", "-p"], timeout_s=0.5) or _run_cmd(["xkb-switch"], timeout_s=0.5)
+        if out:
+            return out.strip()
+    # Alternative: xkblayout-state (if installed).
+    if subprocess.run(["which", "xkblayout-state"], capture_output=True).returncode == 0:
+        out = _run_cmd(["xkblayout-state", "print", "%s"], timeout_s=0.5)
+        if out:
+            return out.strip()
+    return None
+
+
+def detect_current_keyboard_language(layout_to_language: dict[str, str]) -> Optional[str]:
+    """
+    Robustly detect current "language expectation" from the OS keyboard input source.
+
+    Priority:
+    1) Explicit config mapping (layout_to_language) for the detected layout/source id
+    2) macOS: read InputSourceLanguages for the active InputSourceID (HIToolbox)
+    3) Linux/X11: read active XKB layout (requires xkb-switch/xkblayout-state); return if it looks like ISO 639-1
+    """
+    def looks_like_iso_639_1(s: str) -> bool:
+        return len(s) == 2 and s.isalpha()
+
+    layout_id = detect_current_keyboard_layout()
+    if layout_id:
+        mapped = layout_to_language.get(layout_id)
+        if mapped:
+            return mapped
+
+    if IS_MACOS:
+        if not layout_id:
+            return None
+        langs = _macos_input_source_languages_for_id(layout_id)
+        if not langs:
+            return None
+        lang = langs[0].strip().lower()
+        return lang if looks_like_iso_639_1(lang) else None
+
+    active = _linux_active_xkb_layout()
+    if not active:
+        return None
+    mapped = layout_to_language.get(active)
+    if mapped:
+        return mapped
+    active = active.strip().lower()
+    return active if looks_like_iso_639_1(active) else None
+
+
+def language_from_layout(layout_id: Optional[str], layout_to_language: dict[str, str]) -> Optional[str]:
+    """
+    Backward-compatible wrapper (kept for external callers / tests).
+    Prefer `detect_current_keyboard_language()` for actual runtime detection.
+    """
+    if not layout_id:
+        return None
+    return layout_to_language.get(layout_id)
 
 
 def load_config():
@@ -145,6 +335,13 @@ def load_config():
         "auto_sentence": config.getboolean("behavior", "auto_sentence", fallback=True),
         "typing_delay": config.getfloat("behavior", "typing_delay", fallback=0.01),
         "save_recordings": config.getboolean("behavior", "save_recordings", fallback=False),
+        # Streaming-only: comma-separated phrases to suppress if a chunk equals one of them
+        # (punctuation ignored). If empty, feature is disabled.
+        "reject_phrases": config.get("behavior", "reject_phrases", fallback="").strip(),
+        # Language enforcement (optional): use current OS keyboard layout as the "field expectation"
+        "enforce_language_from_layout": config.getboolean("behavior", "enforce_language_from_layout", fallback=False),
+        # Comma-separated list: "<layout_id>:<lang>,<layout_id>:<lang>"
+        "layout_to_language": config.get("behavior", "layout_to_language", fallback="").strip(),
         # Streaming
         "min_speech_length_seconds": config.getfloat("streaming", "min_speech_length_seconds", fallback=1.0),
         "vad_silence_threshold_seconds": config.getfloat("streaming", "vad_silence_threshold_seconds", fallback=1.0),
@@ -203,9 +400,10 @@ def keys_match(
 class Typer:
     """Types and removes characters in any input field via xdotool (Linux) or AppleScript (macOS)."""
 
-    def __init__(self, delay_ms: int = 10, start_delay_ms: int = 250):
+    def __init__(self, delay_ms: int = 10, start_delay_ms: int = 250, macos_use_clipboard_paste: bool = False):
         self.delay_ms = max(1, int(delay_ms))
         self.start_delay_ms = int(start_delay_ms)
+        self.macos_use_clipboard_paste = bool(macos_use_clipboard_paste)
         if IS_MACOS:
             self.enabled = True
         else:
@@ -231,10 +429,43 @@ class Typer:
             self._type_linux(text, previous_length)
 
     def _type_macos(self, text: str, previous_length: int = 0):
+        # On macOS, `System Events` keystroke may be layout-dependent for ASCII.
+        # Pasting via clipboard is layout-independent and works for both Latin/Cyrillic.
+        if self.macos_use_clipboard_paste:
+            # Best-effort preserve clipboard contents.
+            prev_clip = _run_cmd(["pbpaste"], timeout_s=0.8) or ""
+            try:
+                if previous_length > 0:
+                    script = (
+                        'tell application "System Events" to key code 51 using {} -- delete\n'
+                        * previous_length
+                    )
+                    subprocess.run(
+                        ["osascript", "-e", script],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                # Set clipboard to desired text.
+                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                p.communicate(input=text.encode())
+                # Paste (Cmd+V).
+                subprocess.run(
+                    ["osascript", "-e", 'tell application "System Events" to keystroke "v" using {command down}'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            finally:
+                # Restore clipboard.
+                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                p.communicate(input=prev_clip.encode())
+            return
+
+        # Fallback: type via keystroke (can be layout-dependent).
         if previous_length > 0:
             script = f'tell application "System Events" to key code 51 using {{}} -- delete\n' * previous_length
             subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        # Escape for AppleScript string: backslashes then double quotes.
         escaped = text.replace("\\", "\\\\").replace('"', '\\"')
         script = f'tell application "System Events" to keystroke "{escaped}"'
         subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
@@ -275,11 +506,20 @@ class Dictation:
         self.audio_data: list[np.ndarray] = []
         self.sample_rate = 16000
         self.frames_per_buffer = 4096  # ~0.25 seconds of audio
+        self._layout_to_language_map = self._parse_layout_to_language_map(
+            self.config.get("layout_to_language", "")
+        )
+        self._session_enforced_language: Optional[str] = None
+        self._hotkey_action_lock = threading.Lock()
+        self._last_hotkey_event_monotonic: Optional[float] = None
+        self._hotkey_action_in_progress_since: Optional[float] = None
+        self._hotkey_action_in_progress_name: Optional[str] = None
 
         if self.config["auto_type"]:
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
-                start_delay_ms=100  # Delay to avoid modifiers from hotkey
+                start_delay_ms=100,  # Delay to avoid modifiers from hotkey
+                macos_use_clipboard_paste=False,
             )
 
         # Load model in background.
@@ -485,6 +725,63 @@ class Dictation:
             text = text + '.'
         return text
 
+    @staticmethod
+    def _parse_layout_to_language_map(raw: str) -> dict[str, str]:
+        """
+        Parse `behavior.layout_to_language` config into a dict.
+        Format: "<layout_id>:<lang>, <layout_id>:<lang>".
+        """
+        out: dict[str, str] = {}
+        if not raw:
+            return out
+        for part in raw.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            layout_id, lang = part.split(":", 1)
+            layout_id = layout_id.strip()
+            lang = lang.strip().lower()
+            if layout_id and lang:
+                out[layout_id] = lang
+        return out
+
+    def _maybe_enforced_language_for_field(self) -> Optional[str]:
+        """
+        If enabled, infer expected language from current OS keyboard layout.
+        Intended to help when using `language=auto` with allowlists (e.g. en,ru) and the
+        focused field expects one script (URL/email -> EN, chat -> RU, etc.).
+        """
+        # Enforced language is captured once on start_recording (hotkey press) and reused until stop.
+        if self._session_enforced_language:
+            return self._session_enforced_language
+        if not self.config.get("enforce_language_from_layout", False):
+            return None
+        return None
+
+    def _capture_session_enforced_language(self) -> None:
+        """
+        Capture current "field expectation" language once at the start of a dictation session.
+        This intentionally does NOT re-check during a running streaming session for performance and determinism.
+        """
+        self._session_enforced_language = None
+        if not self.config.get("enforce_language_from_layout", False):
+            return
+        if self.config.get("language") is not None:
+            # Fixed whisper language: don't override.
+            return
+        layout_id = detect_current_keyboard_layout()
+        mapped = self._layout_to_language_map.get(layout_id) if layout_id else None
+        lang = detect_current_keyboard_language(self._layout_to_language_map)
+        logger.info(
+            "[lang/layout] detected layout_id=%s mapped=%s captured=%s",
+            layout_id,
+            mapped,
+            lang,
+        )
+        if lang:
+            self._session_enforced_language = lang
+            logger.debug("[lang/layout] captured=%s", lang)
+
     def _transcribe_audio_array(self, audio_array: np.ndarray) -> Tuple[str, float]:
         """
         Check if model is loaded and transcribe an audio numpy array.
@@ -508,12 +805,17 @@ class Dictation:
         # Convert int16 to float32 and normalize to [-1.0, 1.0]
         if audio_array.dtype == np.int16:
             audio_array = audio_array.astype(np.float32) / 32768.0
-        lang = resolve_transcription_language(
-            self.model,
-            audio_array,
-            self.config.get("language"),
-            self.config.get("language_allowlist"),
-        )
+        enforced = self._maybe_enforced_language_for_field()
+        configured_lang = self.config.get("language")
+        allowlist = self.config.get("language_allowlist")
+        if enforced and configured_lang is None:
+            # Only override in auto mode. If allowlist exists, enforce only if it is allowed.
+            if not allowlist or enforced in allowlist:
+                lang = enforced
+            else:
+                lang = resolve_transcription_language(self.model, audio_array, configured_lang, allowlist)
+        else:
+            lang = resolve_transcription_language(self.model, audio_array, configured_lang, allowlist)
         segments, info = self.model.transcribe(
             audio_array,
             vad_filter=True,
@@ -524,12 +826,73 @@ class Dictation:
         return text, info.duration
 
     def on_press(self, key):
-        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-            self.start_recording()
+        try:
+            if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self._last_hotkey_event_monotonic = time.monotonic()
+                self._schedule_hotkey_action(self.start_recording, "start_recording")
+        except Exception as e:
+            # Never let an exception kill the pynput listener thread.
+            logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
 
     def on_release(self, key):
-        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-            self.stop_recording()
+        try:
+            if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self._last_hotkey_event_monotonic = time.monotonic()
+                self._schedule_hotkey_action(self.stop_recording, "stop_recording")
+        except Exception as e:
+            logger.error("[hotkey] on_release failed: %s", e, exc_info=True)
+
+    def _schedule_hotkey_action(self, fn, name: str) -> None:
+        """
+        Run hotkey actions (start/stop) off the pynput callback thread.
+
+        This prevents long operations (thread joins, IO) from blocking key processing and
+        making the app appear to "stop reacting" after quick toggles.
+        """
+
+        def runner():
+            if not self._hotkey_action_lock.acquire(blocking=False):
+                held_s = None
+                if self._hotkey_action_in_progress_since is not None:
+                    held_s = time.monotonic() - self._hotkey_action_in_progress_since
+                logger.warning(
+                    "[hotkey] action %s skipped (in progress=%s held_s=%s)",
+                    name,
+                    self._hotkey_action_in_progress_name or "unknown",
+                    f"{held_s:.2f}" if held_s is not None else "unknown",
+                )
+                # If we get stuck holding the hotkey action lock, we become permanently unresponsive.
+                # In that case, prefer a clean restart under launchd KeepAlive.
+                if held_s is not None and held_s > 10.0:
+                    logger.critical(
+                        "[hotkey] action lock stuck for %.2fs (in_progress=%s). Exiting for launchd restart.",
+                        held_s,
+                        self._hotkey_action_in_progress_name,
+                    )
+                    try:
+                        if self.config.get("notifications"):
+                            self.notify(
+                                "SoupaWhisper stalled",
+                                "Hotkey actions got stuck; restarting the service to recover.",
+                                logging.ERROR,
+                                5000,
+                                "dialog-error",
+                            )
+                    finally:
+                        os._exit(1)
+                return
+            try:
+                self._hotkey_action_in_progress_since = time.monotonic()
+                self._hotkey_action_in_progress_name = name
+                fn()
+            except Exception as e:
+                logger.error("[hotkey] action %s failed: %s", name, e, exc_info=True)
+            finally:
+                self._hotkey_action_in_progress_since = None
+                self._hotkey_action_in_progress_name = None
+                self._hotkey_action_lock.release()
+
+        threading.Thread(target=runner, daemon=True, name=f"hotkey_{name}").start()
 
     def stop(self):
         logger.info("\nExiting...")
@@ -539,12 +902,82 @@ class Dictation:
             self._keyboard_listener.stop()
 
     def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release,
-        ) as listener:
+        def start_listener() -> keyboard.Listener:
+            listener = keyboard.Listener(
+                on_press=self.on_press,
+                on_release=self.on_release,
+            )
+            listener.daemon = True
+            listener.start()
             self._keyboard_listener = listener
-            listener.join()
+            return listener
+
+        if self.config.get("notifications"):
+            self.notify(
+                "SoupaWhisper running",
+                f"Hold {self.get_hotkey_name().upper()} to record, release to transcribe.",
+                logging.INFO,
+                1500,
+                "dialog-information",
+            )
+
+        try:
+            listener = start_listener()
+        except Exception as e:
+            exe = sys.executable
+            logger.error("[hotkey] Failed to start keyboard listener: %s", e, exc_info=True)
+            if self.config.get("notifications"):
+                self.notify(
+                    "Hotkey listener failed",
+                    "SoupaWhisper could not listen for global hotkeys.\n\n"
+                    "On macOS, this usually means missing Accessibility / Input Monitoring permission "
+                    f"for the running executable:\n{exe}",
+                    logging.ERROR,
+                    10000,
+                    "dialog-error",
+                )
+            raise
+
+        last_heartbeat = 0.0
+        restart_backoff_s = 1.0
+        while self.running:
+            time.sleep(0.2)
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                last_heartbeat = now
+                last_hotkey_age = None
+                if self._last_hotkey_event_monotonic is not None:
+                    last_hotkey_age = now - self._last_hotkey_event_monotonic
+
+            # If listener stops unexpectedly, restart and log loudly.
+            if getattr(listener, "running", True) is False:
+                try:
+                    # Best-effort stop old listener (may already be stopped).
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                    time.sleep(restart_backoff_s)
+                    listener = start_listener()
+                    restart_backoff_s = 1.0
+                except Exception as e:
+                    restart_backoff_s = min(30.0, restart_backoff_s * 2.0)
+                    logger.error("[hotkey] Listener restart failed: %s", e, exc_info=True)
+                    if self.config.get("notifications"):
+                        self.notify(
+                            "Hotkey listener stopped",
+                            "SoupaWhisper stopped receiving hotkeys and could not restart.\n\n"
+                            f"Executable: {sys.executable}\n\n"
+                            "If this keeps happening on macOS, re-check Accessibility / Input Monitoring permissions.",
+                            logging.ERROR,
+                            10000,
+                            "dialog-error",
+                        )
+
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
     def _audio_recording_worker(self):
         """Audio recording worker thread that collects audio data into one array."""
@@ -568,6 +1001,9 @@ class Dictation:
         if self.model_error or self.model is None:
             logger.error("Recording is not ready yet.")
             return
+
+        # Capture enforced language once for this session (hotkey press).
+        self._capture_session_enforced_language()
 
         self.recording = True
         self.audio_data = []
@@ -715,7 +1151,8 @@ class StreamingDictation(Dictation):
         if self.config["auto_type"]:
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
-                start_delay_ms=100
+                start_delay_ms=100,
+                macos_use_clipboard_paste=False,
             )
 
         # State variables.
@@ -728,23 +1165,116 @@ class StreamingDictation(Dictation):
         self.speech_silence_duration: float = 0.0
         self.speech_end_time: float = 0.0
         self.accumulated_text = ""
+        self._last_hotkey_event_monotonic: Optional[float] = None
+        self._reject_phrase_set = self._build_reject_phrase_set()
+
+    def _build_reject_phrase_set(self) -> frozenset[str]:
+        raw = (self.config.get("reject_phrases") or "").strip()
+        if not raw:
+            return frozenset()
+        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+        normalized = {_normalize_reject_phrase(p) for p in parts}
+        normalized.discard("")
+        return frozenset(normalized)
+
+    def _should_reject_streaming_chunk(self, text: str) -> bool:
+        """
+        Reject only if the *whole chunk* equals one configured phrase (punctuation ignored).
+        If reject_phrases is empty, feature is disabled and nothing is rejected.
+        """
+        if not self._reject_phrase_set:
+            return False
+        normalized = _normalize_reject_phrase(text)
+        if not normalized:
+            return False
+        return normalized in self._reject_phrase_set
 
     def _finish_model_loading(self):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
     def on_press(self, key):
-        if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
-            if not self.recording:
-                self.start_recording()
-            else:
-                self.stop_recording()
+        try:
+            if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
+                self._last_hotkey_event_monotonic = time.monotonic()
+                if not self.recording:
+                    self._schedule_hotkey_action(self.start_recording, "start_recording")
+                else:
+                    self._schedule_hotkey_action(self.stop_recording, "stop_recording")
+        except Exception as e:
+            logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
 
     def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press
-        ) as listener:
+        def start_listener() -> keyboard.Listener:
+            listener = keyboard.Listener(on_press=self.on_press)
+            listener.daemon = True
+            listener.start()
             self._keyboard_listener = listener
-            listener.join()
+            return listener
+
+        if self.config.get("notifications"):
+            self.notify(
+                "SoupaWhisper running",
+                f"Press {self.get_hotkey_name().upper()} to start/stop streaming transcription.",
+                logging.INFO,
+                1500,
+                "dialog-information",
+            )
+
+        try:
+            listener = start_listener()
+        except Exception as e:
+            exe = sys.executable
+            logger.error("[hotkey] Failed to start keyboard listener: %s", e, exc_info=True)
+            if self.config.get("notifications"):
+                self.notify(
+                    "Hotkey listener failed",
+                    "SoupaWhisper could not listen for global hotkeys.\n\n"
+                    "On macOS, this usually means missing Accessibility / Input Monitoring permission "
+                    f"for the running executable:\n{exe}",
+                    logging.ERROR,
+                    10000,
+                    "dialog-error",
+                )
+            raise
+
+        last_heartbeat = 0.0
+        restart_backoff_s = 1.0
+        while self.running:
+            time.sleep(0.2)
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                last_heartbeat = now
+                last_hotkey_age = None
+                if self._last_hotkey_event_monotonic is not None:
+                    last_hotkey_age = now - self._last_hotkey_event_monotonic
+
+            if getattr(listener, "running", True) is False:
+                try:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                    time.sleep(restart_backoff_s)
+                    listener = start_listener()
+                    restart_backoff_s = 1.0
+                except Exception as e:
+                    restart_backoff_s = min(30.0, restart_backoff_s * 2.0)
+                    logger.error("[hotkey] Listener restart failed: %s", e, exc_info=True)
+                    if self.config.get("notifications"):
+                        self.notify(
+                            "Hotkey listener stopped",
+                            "SoupaWhisper stopped receiving hotkeys and could not restart.\n\n"
+                            f"Executable: {sys.executable}\n\n"
+                            "If this keeps happening on macOS, re-check Accessibility / Input Monitoring permissions.",
+                            logging.ERROR,
+                            10000,
+                            "dialog-error",
+                        )
+
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
     def start_recording(self):
         if self.recording:
@@ -757,6 +1287,8 @@ class StreamingDictation(Dictation):
         if self.model_error or self.model is None:
             self.notify("Error", "Model is not loaded yet", logging.ERROR, 3000)
             return
+        # Capture enforced language once for this streaming session (hotkey press).
+        self._capture_session_enforced_language()
         # Reset transcription state.
         self.recording = True
         self.accumulated_text = ""
@@ -792,7 +1324,8 @@ class StreamingDictation(Dictation):
         if self.config["auto_type"]:
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
-                start_delay_ms=100
+                start_delay_ms=100,
+                macos_use_clipboard_paste=False,
             )
             self.typing_thread = threading.Thread(target=self._typing_worker, daemon=True)
             self.typing_thread.start()
@@ -930,12 +1463,16 @@ class StreamingDictation(Dictation):
                     segment = segment.astype(np.float32) / 32768.0
                 # Note: transcribe() returns an iterator; iteration runs the decoder.
                 trans_start = time.monotonic()
-                lang = resolve_transcription_language(
-                    self.model,
-                    segment,
-                    self.config.get("language"),
-                    self.config.get("language_allowlist"),
-                )
+                enforced = self._maybe_enforced_language_for_field()
+                configured_lang = self.config.get("language")
+                allowlist = self.config.get("language_allowlist")
+                if enforced and configured_lang is None:
+                    if not allowlist or enforced in allowlist:
+                        lang = enforced
+                    else:
+                        lang = resolve_transcription_language(self.model, segment, configured_lang, allowlist)
+                else:
+                    lang = resolve_transcription_language(self.model, segment, configured_lang, allowlist)
                 segments, _ = self.model.transcribe(
                     segment,
                     # Second VAD pass with options tuned for short clips (see _STREAMING_VAD_PARAMETERS).
@@ -952,6 +1489,9 @@ class StreamingDictation(Dictation):
                 trans_duration = time.monotonic() - trans_start
                 if not text:
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
+                    continue
+                if self._should_reject_streaming_chunk(text):
+                    logger.info("[reject] Skipping chunk (matched reject phrase): %r", text)
                     continue
                 else:
                     logger.info(f"[transcriber] Transcribed {len(segment) / float(self.vad_sample_rate):.2f}s in {trans_duration:.2f}s: {text}")
@@ -1220,34 +1760,8 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
         metavar="WAV_FILE",
         help="Transcribe provided WAV file and exit"
     )
-    parser.add_argument(
-        "--test-keys",
-        action="store_true",
-        help="Listen and print key events (for hotkey troubleshooting). Press Ctrl+C to exit."
-    )
     args = parser.parse_args()
     check_dependencies(config)
-
-    # Test keys mode: print every key press and whether it matches configured hotkey.
-    if args.test_keys:
-        config = load_config()
-        hotkey = get_hotkey(config["key"])
-        hotkey_value = getattr(hotkey, "value", None)
-        hotkey_vk = getattr(hotkey_value, "vk", None) if hotkey_value else getattr(hotkey, "vk", None)
-        hotkey_name = getattr(hotkey, "name", None) or getattr(hotkey, "char", config["key"])
-        print(f"Configured hotkey: {hotkey_name} (value={hotkey_value}, vk={hotkey_vk})")
-        print("Press keys (e.g. F10). Matching key will show [MATCH]. Ctrl+C to exit.\n")
-        def on_press(key):
-            try:
-                name = getattr(key, "name", None) or getattr(key, "char", repr(key))
-                vk = getattr(key, "vk", None)
-            except Exception:
-                name, vk = repr(key), None
-            match = keys_match(key, hotkey, hotkey_value, hotkey_vk)
-            print(f"  Key: {name} vk={vk}  {'[MATCH]' if match else ''}")
-        with keyboard.Listener(on_press=on_press) as listener:
-            listener.join()
-        return
 
     # Apply arguments.
     if args.verbose:
