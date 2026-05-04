@@ -219,6 +219,21 @@ Add `--streaming` or `--no-streaming` to override config. Use `--verbose` to lis
 - **Streaming:** press hotkey again to stop; text is emitted in chunks as silence is detected.
 - **Ctrl+C** quits when run in the foreground.
 
+### Custom terms / glossary
+
+Whisper sometimes mishears domain-specific words (`Claude` → `cloud`) or rare phrases (`ML repository` → `a male repository`). You can give it a glossary of custom terms — names, brands, acronyms, technical vocabulary — that it should prefer. The list is passed to faster-whisper as both **`initial_prompt`** (in-context priming) and **`hotwords`** (decoder logit bias), so it works in **streaming and non-streaming modes**.
+
+```ini
+[behavior]
+custom_terms = Claude, Kubernetes, GraphQL, ML repository
+```
+
+- Comma-separated; multi-word phrases are fine. Newlines also work as separators.
+- Case is preserved (Whisper is case-sensitive for many terms).
+- Leave empty / unset to disable.
+- This is a **hint**, not a guarantee. Strongly mismatched audio can still produce other words.
+- Subject to Whisper's ~224-token prompt cap; very long glossaries are silently truncated by the decoder.
+
 ### Streaming: reject specific noise phrases
 
 Whisper can sometimes output short “filler” phrases from noise (coughs, mic bumps, etc.). In **streaming mode only**, you can configure a list of phrases to suppress.
@@ -387,7 +402,7 @@ uv run pytest dictate_tests.py
 - [x] PyAudio for all recordings (no `arecord` dependency).
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
 - [x] Multiple languages support.
-- [ ] Support list of custom terms or pronunciation features (like accents or speech patterns).
+- [x] Support list of custom terms or pronunciation features (like accents or speech patterns).
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
 - [ ] Expose more `model.transcribe()` options in config.

@@ -118,6 +118,44 @@ def _normalize_reject_phrase(text: str) -> str:
     return s.translate(_REJECT_PUNCT_TRANSLATION).strip()
 
 
+def _parse_custom_terms(raw: str) -> list[str]:
+    """
+    Parse a comma/newline-separated custom-terms string into a deduplicated list.
+
+    Order is preserved; case is preserved (Whisper's tokenizer is case-sensitive
+    for some terms like brand names). Empty / whitespace-only entries are dropped.
+    """
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _build_custom_terms_kwargs(terms: list[str]) -> dict:
+    """
+    Build the faster-whisper kwargs that bias transcription toward custom terms.
+
+    Returns an empty dict when there are no terms (so the feature is fully off).
+    Otherwise returns both `initial_prompt` (in-context priming) and `hotwords`
+    (per-token logit boost). Using both is intentional: in streaming mode
+    `condition_on_previous_text=True` causes the initial prompt to be displaced
+    by accumulated transcription over time, while hotwords stays active per chunk.
+    """
+    if not terms:
+        return {}
+    return {
+        "initial_prompt": "Glossary: " + ", ".join(terms) + ".",
+        "hotwords": " ".join(terms),
+    }
+
+
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
 DEFAULT_HOTKEY = "f12"
@@ -338,6 +376,9 @@ def load_config():
         # Streaming-only: comma-separated phrases to suppress if a chunk equals one of them
         # (punctuation ignored). If empty, feature is disabled.
         "reject_phrases": config.get("behavior", "reject_phrases", fallback="").strip(),
+        # Custom terms / glossary biased into transcription via faster-whisper's
+        # initial_prompt + hotwords. Comma-separated; empty disables the feature.
+        "custom_terms": config.get("behavior", "custom_terms", fallback="").strip(),
         # Language enforcement (optional): use current OS keyboard layout as the "field expectation"
         "enforce_language_from_layout": config.getboolean("behavior", "enforce_language_from_layout", fallback=False),
         # Comma-separated list: "<layout_id>:<lang>,<layout_id>:<lang>"
@@ -514,6 +555,11 @@ class Dictation:
         self._last_hotkey_event_monotonic: Optional[float] = None
         self._hotkey_action_in_progress_since: Optional[float] = None
         self._hotkey_action_in_progress_name: Optional[str] = None
+
+        custom_terms = _parse_custom_terms(self.config.get("custom_terms") or "")
+        self._custom_terms_kwargs = _build_custom_terms_kwargs(custom_terms)
+        if custom_terms:
+            logger.info(f"Custom terms glossary active ({len(custom_terms)} term(s)): {custom_terms}")
 
         if self.config["auto_type"]:
             self.typer = Typer(
@@ -820,6 +866,7 @@ class Dictation:
             audio_array,
             vad_filter=True,
             language=lang,
+            **self._custom_terms_kwargs,
         )
         # Convert segments to text.
         text = self._segments_to_text(segments, self.config["auto_sentence"])
@@ -1484,6 +1531,7 @@ class StreamingDictation(Dictation):
                     language=lang,
                     condition_on_previous_text=True,
                     without_timestamps=True,
+                    **self._custom_terms_kwargs,
                 )
                 text = _streaming_segments_to_text(segments)
                 trans_duration = time.monotonic() - trans_start

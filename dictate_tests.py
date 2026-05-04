@@ -242,6 +242,117 @@ class TestStreamingDictation:
         assert d._should_reject_streaming_chunk("um well") is False
 
 
+class TestCustomTerms:
+    """Tests for custom-terms glossary (initial_prompt + hotwords biasing)."""
+
+    def test_parse_custom_terms_empty(self):
+        assert dictate._parse_custom_terms("") == []
+        assert dictate._parse_custom_terms("   ") == []
+        assert dictate._parse_custom_terms(",,, ,") == []
+
+    def test_parse_custom_terms_comma_separated(self):
+        assert dictate._parse_custom_terms("Claude, Kubernetes, GraphQL") == [
+            "Claude", "Kubernetes", "GraphQL"
+        ]
+
+    def test_parse_custom_terms_newline_separated(self):
+        assert dictate._parse_custom_terms("Claude\nKubernetes\nGraphQL") == [
+            "Claude", "Kubernetes", "GraphQL"
+        ]
+
+    def test_parse_custom_terms_preserves_case_and_multiword(self):
+        assert dictate._parse_custom_terms("ML repository, Claude") == [
+            "ML repository", "Claude"
+        ]
+
+    def test_parse_custom_terms_dedup_preserves_order(self):
+        assert dictate._parse_custom_terms("Claude, Kubernetes, Claude, GraphQL") == [
+            "Claude", "Kubernetes", "GraphQL"
+        ]
+
+    def test_build_custom_terms_kwargs_empty_returns_empty_dict(self):
+        assert dictate._build_custom_terms_kwargs([]) == {}
+
+    def test_build_custom_terms_kwargs_populated(self):
+        kw = dictate._build_custom_terms_kwargs(["Claude", "ML repository"])
+        assert kw == {
+            "initial_prompt": "Glossary: Claude, ML repository.",
+            "hotwords": "Claude ML repository",
+        }
+
+    def test_load_config_custom_terms_default_empty(self, mock_config):
+        config = dictate.load_config()
+        assert config["custom_terms"] == ""
+
+    def test_load_config_custom_terms_parsed_from_behavior(self, mock_config):
+        content = mock_config.read_text()
+        mock_config.write_text(
+            content.replace(
+                "clipboard = true",
+                "clipboard = true\ncustom_terms = Claude, Kubernetes, ML repository",
+            )
+        )
+        config = dictate.load_config()
+        assert config["custom_terms"] == "Claude, Kubernetes, ML repository"
+
+    def test_dictation_caches_empty_kwargs_when_unset(self, mock_config, mock_whisper_model, mock_xdotool):
+        config = dictate.load_config()
+        d = dictate.Dictation(config)
+        d.model_loaded.wait(timeout=1.0)
+        assert d._custom_terms_kwargs == {}
+
+    def test_dictation_caches_kwargs_when_configured(self, mock_config, mock_whisper_model, mock_xdotool):
+        content = mock_config.read_text()
+        mock_config.write_text(
+            content.replace(
+                "clipboard = true",
+                "clipboard = true\ncustom_terms = Claude, Kubernetes",
+            )
+        )
+        config = dictate.load_config()
+        d = dictate.Dictation(config)
+        d.model_loaded.wait(timeout=1.0)
+        assert d._custom_terms_kwargs == {
+            "initial_prompt": "Glossary: Claude, Kubernetes.",
+            "hotwords": "Claude Kubernetes",
+        }
+
+    def test_custom_terms_passed_to_non_streaming_transcribe(self, mock_config, mock_whisper_model, mock_xdotool):
+        content = mock_config.read_text()
+        mock_config.write_text(
+            content.replace(
+                "clipboard = true",
+                "clipboard = true\ncustom_terms = Claude, Kubernetes",
+            )
+        )
+        config = dictate.load_config()
+        d = dictate.Dictation(config)
+        d.model = mock_whisper_model
+        d.model_error = None
+        d.model_loaded.set()
+
+        audio = np.zeros(1600, dtype=np.int16)
+        d._transcribe_audio_array(audio)
+
+        _, kwargs = mock_whisper_model.transcribe_calls[-1]
+        assert kwargs.get("initial_prompt") == "Glossary: Claude, Kubernetes."
+        assert kwargs.get("hotwords") == "Claude Kubernetes"
+
+    def test_custom_terms_absent_when_disabled_non_streaming(self, mock_config, mock_whisper_model, mock_xdotool):
+        config = dictate.load_config()
+        d = dictate.Dictation(config)
+        d.model = mock_whisper_model
+        d.model_error = None
+        d.model_loaded.set()
+
+        audio = np.zeros(1600, dtype=np.int16)
+        d._transcribe_audio_array(audio)
+
+        _, kwargs = mock_whisper_model.transcribe_calls[-1]
+        assert "initial_prompt" not in kwargs
+        assert "hotwords" not in kwargs
+
+
 class TestDictation:
     """Tests for non-streaming Dictation class (backward compatibility)."""
     
