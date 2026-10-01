@@ -44,4 +44,4 @@ jobs:
           pip install -e . pytest pytest-timeout
 
       - name: Run tests
-        run: pytest dictate_tests.py
+        run: pytest dictate_tests.py meeting_tests.py
