@@ -2048,3 +2048,273 @@ class TestSharedGlossaryAndRejectPhrases(NoBackgroundModelLoad):
 
         assert d.should_reject_text("Thank you!!!") is True
         assert d.should_reject_text("thank you for that") is False
+
+
+class TestStreamingTextContext:
+    def make_worker(self, texts, languages=None, allowlist=None, language='en'):
+        d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
+        d.config = {
+            'language': language, 'language_allowlist': allowlist,
+            'streaming_context_words': 50, 'streaming_context_reset_seconds': 5.0,
+        }
+        d.vad_sample_rate = 16000
+        d.recording = d.stopping = d.file_mode = False
+        d.transcription_queue = queue.Queue()
+        d.typing_queue = queue.Queue()
+        d.accumulated_text = ''
+        d.custom_terms_kwargs = dictate._build_custom_terms_kwargs(['ELK', 'GitHub Actions'])
+        d._check_valid_audio_input = lambda audio: False
+        d._maybe_enforced_language_for_field = lambda: None
+        d.should_reject_text = lambda text: text == 'thanks'
+        responses = iter(texts)
+        detected = iter(languages or [])
+        d.model = MagicMock()
+        d.model.detect_language.side_effect = lambda *a, **kw: next(detected)
+
+        def transcribe(audio, **kw):
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return [SimpleNamespace(text=response)], SimpleNamespace(language=kw.get('language') or 'en')
+
+        d.model.transcribe.side_effect = transcribe
+        return d
+
+    def run_chunks(self, d, spans):
+        # These worker fixtures bypass __init__; populate its configuration fields.
+        d.context_words = d.config['streaming_context_words']
+        d.context_reset_seconds = d.config['streaming_context_reset_seconds']
+        for start, end in spans:
+            audio = np.full(1600, 5000, dtype=np.int16)
+            d.transcription_queue.put(dictate._StreamingChunk(audio, start, end))
+        d.transcription_queue.put(None)
+        d._transcription_worker()
+        return [call.kwargs for call in d.model.transcribe.call_args_list]
+
+    def test_next_chunk_receives_context_without_retyping_prior_output(self):
+        d = self.make_worker(['We use ELK.', 'And GitHub Actions.'])
+        glossary = dict(d.custom_terms_kwargs)
+        calls = self.run_chunks(d, [(0, 1), (2, 3)])
+
+        assert calls[0]['initial_prompt'] == glossary['initial_prompt']
+        assert calls[1]['initial_prompt'] == glossary['initial_prompt'] + '\nWe use ELK.'
+        assert calls[1]['hotwords'] == glossary['hotwords']
+        assert d.custom_terms_kwargs == glossary
+        assert d.accumulated_text == 'We use ELK. And GitHub Actions.'
+        assert list(d.typing_queue.queue) == [('We use ELK.', 1), (' And GitHub Actions.', 2)]
+        assert [len(c.args[0]) for c in d.model.transcribe.call_args_list] == [1600, 1600]
+
+    @pytest.mark.parametrize('gap,keeps_context', [(4.99, True), (5, False), (8, False)])
+    def test_silence_reset_uses_speech_gap_including_exact_five_seconds(self, gap, keeps_context):
+        d = self.make_worker(['Old sentence.', 'Correction.'])
+        calls = self.run_chunks(d, [(0, 1), (1 + gap, 2 + gap)])
+        assert ('Old sentence.' in calls[1]['initial_prompt']) is keeps_context
+        assert calls[1]['hotwords'] == d.custom_terms_kwargs['hotwords']
+        assert d.accumulated_text == 'Old sentence. Correction.'
+
+    def test_slow_decoder_does_not_reset_continuous_speech(self, monkeypatch):
+        # Simulate inference taking 100 seconds per chunk, with queued speech only
+        # one second apart. Never use these completion times as silence evidence.
+        ticks = iter([0, 100, 101, 201])
+        monkeypatch.setattr(dictate, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+        d = self.make_worker(['First.', 'Second.'])
+        calls = self.run_chunks(d, [(0, 1), (2, 3)])
+        assert calls[1]['initial_prompt'].endswith('\nFirst.')
+
+    def test_recent_text_accumulates_but_is_limited_to_fifty_words(self):
+        first = ' '.join(f'a{i}' for i in range(40))
+        second = ' '.join(f'b{i}' for i in range(30))
+        d = self.make_worker([first, second, 'Next.'])
+        calls = self.run_chunks(d, [(0, 1), (2, 3), (4, 5)])
+        tail = calls[2]['initial_prompt'].split('\n')[1]
+        assert tail.split() == (first + ' ' + second).split()[-50:]
+
+    def test_context_also_works_without_a_glossary(self):
+        d = self.make_worker(['First.', 'Second.'])
+        d.custom_terms_kwargs = {}
+        calls = self.run_chunks(d, [(0, 1), (2, 3)])
+        assert 'initial_prompt' not in calls[0]
+        assert calls[1]['initial_prompt'] == 'First.'
+
+    def test_new_worker_session_starts_with_only_the_glossary(self):
+        d = self.make_worker(['First session.', 'New session.'])
+        self.run_chunks(d, [(0, 1)])
+        d.accumulated_text = ''
+        calls = self.run_chunks(d, [(0, 1)])
+        assert calls[1]['initial_prompt'] == d.custom_terms_kwargs['initial_prompt']
+
+    @pytest.mark.parametrize('languages', [('en', 'ru', 'ru'), ('ru', 'en', 'en')])
+    def test_selected_language_switch_clears_context_before_decoding(self, languages):
+        scores = [(lang, .9, [(lang, .9)]) for lang in languages]
+        d = self.make_worker(['First.', 'Second.', 'Third.'], scores,
+                             allowlist=['en', 'ru'], language=None)
+        calls = self.run_chunks(d, [(0, 1), (2, 3), (4, 5)])
+        assert calls[1]['initial_prompt'] == d.custom_terms_kwargs['initial_prompt']
+        assert calls[2]['initial_prompt'].endswith('\nSecond.')
+        assert [c['language'] for c in calls] == list(languages)
+
+    def test_unrestricted_auto_resolves_language_before_using_context(self):
+        scores = [('ru', .9, [('ru', .9)]), ('ru', .9, [('ru', .9)])]
+        d = self.make_worker(['English.', 'Russian.', 'More Russian.'], scores, language=None)
+        calls = self.run_chunks(d, [(0, 1), (2, 3), (4, 5)])
+        # First decode auto-detects English; subsequent calls preflight language.
+        assert calls[0]['language'] is None
+        assert calls[1]['language'] == 'ru'
+        assert calls[1]['initial_prompt'] == d.custom_terms_kwargs['initial_prompt']
+        assert calls[2]['initial_prompt'].endswith('\nRussian.')
+        options = d.model.detect_language.call_args.kwargs['vad_parameters']
+        assert isinstance(options, dictate.VadOptions)
+        assert options.threshold == .33
+
+    def test_failed_auto_language_preflight_clears_context_and_keeps_decoding(self):
+        d = self.make_worker(['First.', 'Second.'], language=None)
+        d.model.detect_language.side_effect = RuntimeError('detector failed')
+        calls = self.run_chunks(d, [(0, 1), (2, 3)])
+        assert calls[1]['initial_prompt'] == d.custom_terms_kwargs['initial_prompt']
+        assert calls[1]['language'] is None
+        assert d.accumulated_text == 'First. Second.'
+
+    def test_fixed_language_does_not_add_detection_calls(self):
+        d = self.make_worker(['First.', 'Second.'])
+        self.run_chunks(d, [(0, 1), (2, 3)])
+        d.model.detect_language.assert_not_called()
+
+    def test_layout_enforcement_still_takes_priority(self):
+        d = self.make_worker(['First.', 'Second.'], language=None, allowlist=['en', 'ru'])
+        d._maybe_enforced_language_for_field = lambda: 'ru'
+        calls = self.run_chunks(d, [(0, 1), (2, 3)])
+        assert [c['language'] for c in calls] == ['ru', 'ru']
+        assert calls[1]['initial_prompt'].endswith('\nFirst.')
+        d.model.detect_language.assert_not_called()
+
+    def test_rejected_speech_is_not_prompted_but_is_not_counted_as_silence(self):
+        d = self.make_worker(['First.', 'thanks', 'Second.'])
+        calls = self.run_chunks(d, [(0, 1), (5, 6), (10, 11)])
+        assert calls[2]['initial_prompt'].endswith('\nFirst.')
+        assert 'thanks' not in calls[2]['initial_prompt']
+        assert d.accumulated_text == 'First. Second.'
+
+    @pytest.mark.parametrize('failed', ['', RuntimeError('decode failed')])
+    def test_empty_or_failed_decode_clears_untrusted_context(self, failed):
+        d = self.make_worker(['First.', failed, 'Second.'])
+        calls = self.run_chunks(d, [(0, 1), (2, 3), (4, 5)])
+        assert calls[2]['initial_prompt'] == d.custom_terms_kwargs['initial_prompt']
+        assert d.accumulated_text == 'First. Second.'
+
+
+class TestStreamingSpeechTimestamps:
+    def make_capture(self):
+        d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
+        d.vad_sample_rate = 16000
+        d.vad_frame_size = 480
+        d.vad_min_speech_chunks = 0
+        d.vad_silence_threshold_seconds = .06
+        d.config = {'save_recordings': False}
+        d.file_mode = False
+        d.transcription_queue = queue.Queue()
+        d.vad = MagicMock()
+        d._reset_speech_mode()
+        return d
+
+    @pytest.mark.parametrize('forced', [False, True])
+    def test_queued_bounds_exclude_trailing_silence_and_include_first_speech(self, forced):
+        d = self.make_capture()
+        frame = np.full(480, 5000, dtype=np.int16)
+        d.vad.is_speech.return_value = True
+        d._process_audio_chunk(frame, 1.0, .03)
+        d.vad.is_speech.return_value = False
+        d._process_audio_chunk(frame, 1.03, .03)
+        if forced:
+            d._finalize_segment()
+        else:
+            d._process_audio_chunk(frame, 1.06, .03)
+        chunk = d.transcription_queue.get_nowait()
+        assert chunk.speech_start == 1.0
+        assert chunk.speech_end == pytest.approx(1.03)
+        assert len(chunk.audio) == 960
+
+    def test_capture_timestamps_follow_samples_even_if_worker_scheduling_changes(self):
+        d = self.make_capture()
+        d.recording = True
+        d.audio_stream = MagicMock()
+        reads = []
+
+        def read(*args, **kw):
+            reads.append(None)
+            if len(reads) == 2:
+                d.recording = False
+            return np.full(480, 5000, dtype=np.int16).tobytes()
+
+        d.audio_stream.read.side_effect = read
+        d._process_audio_chunk = MagicMock()
+        d._finalize_segment = MagicMock()
+        d._continuous_audio_stream_worker(480)
+        assert [c.args[1] for c in d._process_audio_chunk.call_args_list] == [0, .03]
+        assert [c.args[2] for c in d._process_audio_chunk.call_args_list] == [.03, .03]
+
+
+class TestStreamingContextConfiguration:
+    def test_defaults_preserve_the_original_context_behavior(self, mock_config):
+        config = dictate.load_config()
+        assert config['streaming_context_words'] == 50
+        assert config['streaming_context_reset_seconds'] == 5.0
+
+    def test_reads_both_streaming_overrides(self, mock_config):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', '[streaming]\ncontext_words = 12\ncontext_reset_seconds = 2.5'
+        ))
+        config = dictate.load_config()
+        assert config['streaming_context_words'] == 12
+        assert config['streaming_context_reset_seconds'] == 2.5
+
+    @pytest.mark.parametrize('key,value', [
+        ('context_words', '-1'), ('context_words', '1.5'),
+        ('context_reset_seconds', '-1'), ('context_reset_seconds', 'nan'),
+        ('context_reset_seconds', 'inf'),
+    ])
+    def test_invalid_values_are_rejected(self, mock_config, key, value):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', f'[streaming]\n{key} = {value}'
+        ))
+        with pytest.raises(ValueError):
+            dictate.load_config()
+
+    def test_custom_word_limit_is_used_by_the_worker(self):
+        helper = TestStreamingTextContext()
+        d = helper.make_worker(['one two three four', 'five six', 'Next.'])
+        d.config['streaming_context_words'] = 3
+        calls = helper.run_chunks(d, [(0, 1), (2, 3), (4, 5)])
+        assert calls[1]['initial_prompt'].endswith('\ntwo three four')
+        assert calls[2]['initial_prompt'].endswith('\nfour five six')
+
+    def test_zero_words_disables_history_and_preserves_glossary(self, mock_config):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', '[streaming]\ncontext_words = 0'
+        ))
+        helper = TestStreamingTextContext()
+        d = helper.make_worker(['First.', 'Second.'])
+        d.config.update(dictate.load_config())
+        calls = helper.run_chunks(d, [(0, 1), (2, 3)])
+        assert [c['initial_prompt'] for c in calls] == [d.custom_terms_kwargs['initial_prompt']] * 2
+        assert d.accumulated_text == 'First. Second.'
+
+    @pytest.mark.parametrize('reset_seconds,keeps_context', [(2, False), (10, True), (0, False)])
+    def test_custom_reset_interval_is_used_by_the_worker(self, mock_config, reset_seconds, keeps_context):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', f'[streaming]\ncontext_reset_seconds = {reset_seconds}'
+        ))
+        helper = TestStreamingTextContext()
+        d = helper.make_worker(['First.', 'Second.'])
+        d.config.update(dictate.load_config())
+        calls = helper.run_chunks(d, [(0, 1), (4, 5)])
+        assert ('First.' in calls[1]['initial_prompt']) is keeps_context
+
+    def test_constructor_stores_context_settings_like_other_streaming_parameters(self, mock_config, mock_whisper_model):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', '[streaming]\ncontext_words = 12\ncontext_reset_seconds = 2.5'
+        ))
+        config = dictate.load_config()
+        config['auto_type'] = False
+        d = dictate.StreamingDictation(config)
+        assert d.context_words == 12
+        assert d.context_reset_seconds == 2.5

@@ -142,6 +142,8 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 | **Streaming** | `--streaming` / `default_streaming = true` | Press hotkey to start, press again to stop. Silence (VAD) splits speech into chunks; each chunk is transcribed and inserted as you go — this is the speak+type flow. |
 | **Non-streaming (push-to-talk)** | `--no-streaming` / `default_streaming = false` | Hold hotkey to record, release to transcribe the whole buffer once, then clipboard + type. Better for short precise utterances; held keys can misbehave in some terminals/apps. |
 
+Streaming uses recent text for better recognition. Under `[streaming]`, `context_words` controls its size (default `50`; `0` disables) and `context_reset_seconds` sets the silence reset interval (default `5.0`).
+
 Default hotkey is **F12** (configurable). Ctrl+C quits a foreground process.
 
 ---
