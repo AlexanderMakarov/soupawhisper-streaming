@@ -2245,3 +2245,60 @@ class TestStreamingSpeechTimestamps:
         d._continuous_audio_stream_worker(480)
         assert [c.args[1] for c in d._process_audio_chunk.call_args_list] == [0, .03]
         assert [c.args[2] for c in d._process_audio_chunk.call_args_list] == [.03, .03]
+
+
+class TestStreamingContextConfiguration:
+    def test_defaults_preserve_the_original_context_behavior(self, mock_config):
+        config = dictate.load_config()
+        assert config['streaming_context_words'] == 50
+        assert config['streaming_context_reset_seconds'] == 5.0
+
+    def test_reads_both_streaming_overrides(self, mock_config):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', '[streaming]\ncontext_words = 12\ncontext_reset_seconds = 2.5'
+        ))
+        config = dictate.load_config()
+        assert config['streaming_context_words'] == 12
+        assert config['streaming_context_reset_seconds'] == 2.5
+
+    @pytest.mark.parametrize('key,value', [
+        ('context_words', '-1'), ('context_words', '1.5'),
+        ('context_reset_seconds', '-1'), ('context_reset_seconds', 'nan'),
+        ('context_reset_seconds', 'inf'),
+    ])
+    def test_invalid_values_are_rejected(self, mock_config, key, value):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', f'[streaming]\n{key} = {value}'
+        ))
+        with pytest.raises(ValueError):
+            dictate.load_config()
+
+    def test_custom_word_limit_is_used_by_the_worker(self):
+        helper = TestStreamingTextContext()
+        d = helper.make_worker(['one two three four', 'five six', 'Next.'])
+        d.config['streaming_context_words'] = 3
+        calls = helper.run_chunks(d, [(0, 1), (2, 3), (4, 5)])
+        assert calls[1]['initial_prompt'].endswith('\ntwo three four')
+        assert calls[2]['initial_prompt'].endswith('\nfour five six')
+
+    def test_zero_words_disables_history_and_preserves_glossary(self, mock_config):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', '[streaming]\ncontext_words = 0'
+        ))
+        helper = TestStreamingTextContext()
+        d = helper.make_worker(['First.', 'Second.'])
+        d.config.update(dictate.load_config())
+        calls = helper.run_chunks(d, [(0, 1), (2, 3)])
+        assert [c['initial_prompt'] for c in calls] == [d.custom_terms_kwargs['initial_prompt']] * 2
+        assert d.accumulated_text == 'First. Second.'
+
+    @pytest.mark.parametrize('reset_seconds,keeps_context', [(2, False), (10, True), (0, False)])
+    def test_custom_reset_interval_is_used_by_the_worker(self, mock_config, reset_seconds, keeps_context):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', f'[streaming]\ncontext_reset_seconds = {reset_seconds}'
+        ))
+        helper = TestStreamingTextContext()
+        d = helper.make_worker(['First.', 'Second.'])
+        d.config.update(dictate.load_config())
+        calls = helper.run_chunks(d, [(0, 1), (4, 5)])
+        assert ('First.' in calls[1]['initial_prompt']) is keeps_context

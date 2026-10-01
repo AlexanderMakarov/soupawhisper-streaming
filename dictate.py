@@ -15,6 +15,7 @@ import queue
 import time
 import wave
 import logging
+import math
 import plistlib
 import string
 from dataclasses import dataclass
@@ -57,8 +58,8 @@ _STREAMING_VAD_PARAMETERS = {
 }
 
 
-_STREAMING_CONTEXT_WORDS = 50
-_STREAMING_CONTEXT_RESET_S = 5.0
+_DEFAULT_STREAMING_CONTEXT_WORDS = 50
+_DEFAULT_STREAMING_CONTEXT_RESET_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -493,6 +494,17 @@ def load_config():
         if not language_allowlist:
             language_allowlist = None
 
+    context_words = config.getint(
+        "streaming", "context_words", fallback=_DEFAULT_STREAMING_CONTEXT_WORDS
+    )
+    context_reset_seconds = config.getfloat(
+        "streaming", "context_reset_seconds", fallback=_DEFAULT_STREAMING_CONTEXT_RESET_S
+    )
+    if context_words < 0:
+        raise ValueError("[streaming] context_words must be non-negative (0 disables text context)")
+    if not math.isfinite(context_reset_seconds) or context_reset_seconds < 0:
+        raise ValueError("[streaming] context_reset_seconds must be finite and non-negative")
+
     return {
         # Whisper
         "model": config.get("whisper", "model", fallback="base.en"),
@@ -528,6 +540,8 @@ def load_config():
         "tray_icon": config.getboolean("behavior", "tray_icon", fallback=True),
         "tray_show_language": config.getboolean("behavior", "tray_show_language", fallback=True),
         # Streaming
+        "streaming_context_words": context_words,
+        "streaming_context_reset_seconds": context_reset_seconds,
         "min_speech_length_seconds": config.getfloat("streaming", "min_speech_length_seconds", fallback=1.0),
         "vad_silence_threshold_seconds": config.getfloat("streaming", "vad_silence_threshold_seconds", fallback=1.0),
         "vad_sample_rate": config.getint("streaming", "vad_sample_rate", fallback=16000),
@@ -2027,6 +2041,10 @@ class StreamingDictation(Dictation):
     def _transcription_worker(self):
         """Transcription worker thread - processes chunks in order."""
         chunk_idx = 0
+        context_words = self.config.get("streaming_context_words", _DEFAULT_STREAMING_CONTEXT_WORDS)
+        context_reset_seconds = self.config.get(
+            "streaming_context_reset_seconds", _DEFAULT_STREAMING_CONTEXT_RESET_S
+        )
         # Worker-local history starts fresh for each live/file session.
         recent_text = ""
         previous_language = None
@@ -2043,7 +2061,7 @@ class StreamingDictation(Dictation):
                     break
                 if (
                     previous_speech_end is not None
-                    and chunk.speech_start - previous_speech_end >= _STREAMING_CONTEXT_RESET_S
+                    and chunk.speech_start - previous_speech_end >= context_reset_seconds
                 ):
                     recent_text = ""
                     previous_language = None
@@ -2118,7 +2136,10 @@ class StreamingDictation(Dictation):
                 else:
                     logger.info(f"[transcriber] Transcribed {len(segment) / float(self.vad_sample_rate):.2f}s in {trans_duration:.2f}s: {text}")
                 # Only accepted output becomes prompt context, never glossary text.
-                recent_text = " ".join((recent_text + " " + text).split()[-_STREAMING_CONTEXT_WORDS:])
+                recent_text = (
+                    " ".join((recent_text + " " + text).split()[-context_words:])
+                    if context_words else ""
+                )
                 # Add space before chunk if it's not the first one
                 if chunk_idx > 0:
                     text = " " + text
