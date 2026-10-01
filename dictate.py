@@ -58,10 +58,6 @@ _STREAMING_VAD_PARAMETERS = {
 }
 
 
-_DEFAULT_STREAMING_CONTEXT_WORDS = 50
-_DEFAULT_STREAMING_CONTEXT_RESET_S = 5.0
-
-
 @dataclass(frozen=True)
 class _StreamingChunk:
     """Audio plus speech bounds on the capture timeline, excluding trailing silence."""
@@ -495,10 +491,10 @@ def load_config():
             language_allowlist = None
 
     context_words = config.getint(
-        "streaming", "context_words", fallback=_DEFAULT_STREAMING_CONTEXT_WORDS
+        "streaming", "context_words", fallback=50
     )
     context_reset_seconds = config.getfloat(
-        "streaming", "context_reset_seconds", fallback=_DEFAULT_STREAMING_CONTEXT_RESET_S
+        "streaming", "context_reset_seconds", fallback=5.0
     )
     if context_words < 0:
         raise ValueError("[streaming] context_words must be non-negative (0 disables text context)")
@@ -1773,6 +1769,8 @@ class StreamingDictation(Dictation):
     def __init__(self, config: dict):
         # Initialize base class (sets up config, hotkey, model loading, etc.)
         super().__init__(config)
+        self.context_words = config["streaming_context_words"]
+        self.context_reset_seconds = config["streaming_context_reset_seconds"]
         self.min_speech_length_seconds = config["min_speech_length_seconds"]
         self.vad_silence_threshold_seconds = config["vad_silence_threshold_seconds"]
         self.vad_sample_rate = config["vad_sample_rate"]
@@ -2041,10 +2039,6 @@ class StreamingDictation(Dictation):
     def _transcription_worker(self):
         """Transcription worker thread - processes chunks in order."""
         chunk_idx = 0
-        context_words = self.config.get("streaming_context_words", _DEFAULT_STREAMING_CONTEXT_WORDS)
-        context_reset_seconds = self.config.get(
-            "streaming_context_reset_seconds", _DEFAULT_STREAMING_CONTEXT_RESET_S
-        )
         # Worker-local history starts fresh for each live/file session.
         recent_text = ""
         previous_language = None
@@ -2061,7 +2055,7 @@ class StreamingDictation(Dictation):
                     break
                 if (
                     previous_speech_end is not None
-                    and chunk.speech_start - previous_speech_end >= context_reset_seconds
+                    and chunk.speech_start - previous_speech_end >= self.context_reset_seconds
                 ):
                     recent_text = ""
                     previous_language = None
@@ -2137,8 +2131,8 @@ class StreamingDictation(Dictation):
                     logger.info(f"[transcriber] Transcribed {len(segment) / float(self.vad_sample_rate):.2f}s in {trans_duration:.2f}s: {text}")
                 # Only accepted output becomes prompt context, never glossary text.
                 recent_text = (
-                    " ".join((recent_text + " " + text).split()[-context_words:])
-                    if context_words else ""
+                    " ".join((recent_text + " " + text).split()[-self.context_words:])
+                    if self.context_words else ""
                 )
                 # Add space before chunk if it's not the first one
                 if chunk_idx > 0:

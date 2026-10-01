@@ -2053,7 +2053,10 @@ class TestSharedGlossaryAndRejectPhrases(NoBackgroundModelLoad):
 class TestStreamingTextContext:
     def make_worker(self, texts, languages=None, allowlist=None, language='en'):
         d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
-        d.config = {'language': language, 'language_allowlist': allowlist}
+        d.config = {
+            'language': language, 'language_allowlist': allowlist,
+            'streaming_context_words': 50, 'streaming_context_reset_seconds': 5.0,
+        }
         d.vad_sample_rate = 16000
         d.recording = d.stopping = d.file_mode = False
         d.transcription_queue = queue.Queue()
@@ -2078,6 +2081,9 @@ class TestStreamingTextContext:
         return d
 
     def run_chunks(self, d, spans):
+        # These worker fixtures bypass __init__; populate its configuration fields.
+        d.context_words = d.config['streaming_context_words']
+        d.context_reset_seconds = d.config['streaming_context_reset_seconds']
         for start, end in spans:
             audio = np.full(1600, 5000, dtype=np.int16)
             d.transcription_queue.put(dictate._StreamingChunk(audio, start, end))
@@ -2302,3 +2308,13 @@ class TestStreamingContextConfiguration:
         d.config.update(dictate.load_config())
         calls = helper.run_chunks(d, [(0, 1), (4, 5)])
         assert ('First.' in calls[1]['initial_prompt']) is keeps_context
+
+    def test_constructor_stores_context_settings_like_other_streaming_parameters(self, mock_config, mock_whisper_model):
+        mock_config.write_text(mock_config.read_text().replace(
+            '[streaming]', '[streaming]\ncontext_words = 12\ncontext_reset_seconds = 2.5'
+        ))
+        config = dictate.load_config()
+        config['auto_type'] = False
+        d = dictate.StreamingDictation(config)
+        assert d.context_words == 12
+        assert d.context_reset_seconds == 2.5
