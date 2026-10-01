@@ -17,9 +17,11 @@ import wave
 import logging
 import plistlib
 import string
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable, Tuple
 from faster_whisper.transcribe import Segment
+from faster_whisper.vad import VadOptions
 
 import numpy as np
 import pyaudio
@@ -53,6 +55,19 @@ _STREAMING_VAD_PARAMETERS = {
     "min_silence_duration_ms": 120,
     "speech_pad_ms": 200,
 }
+
+
+_STREAMING_CONTEXT_WORDS = 50
+_STREAMING_CONTEXT_RESET_S = 5.0
+
+
+@dataclass(frozen=True)
+class _StreamingChunk:
+    """Audio plus speech bounds on the capture timeline, excluding trailing silence."""
+
+    audio: np.ndarray
+    speech_start: float
+    speech_end: float
 
 
 def resolve_transcription_language(
@@ -1758,7 +1773,7 @@ class StreamingDictation(Dictation):
 
         # Workers, queues, etc.
         self.audio_interface: Optional[pyaudio.PyAudio] = None
-        self.transcription_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        self.transcription_queue: queue.Queue[_StreamingChunk | None] = queue.Queue()
         self.typing_queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
         self.file_saving_queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue()
         self.audio_stream = None
@@ -1897,21 +1912,30 @@ class StreamingDictation(Dictation):
         self.notify("Recording...", f"Press {self.get_hotkey_name().upper()} when done", logging.INFO, 1500, "audio-input-microphone")
 
     def _continuous_audio_stream_worker(self, frames_per_buffer: int):
-        chunk_duration = frames_per_buffer / float(self.vad_sample_rate)
+        captured_samples = 0
         try:
             while self.recording:
                 if not self.audio_stream:
                     break
-                chunk_start_time = time.monotonic() - self.recording_start_time
                 data = self.audio_stream.read(frames_per_buffer, exception_on_overflow=False)
                 if not data:
                     continue
                 samples = np.frombuffer(data, dtype=np.int16)
-                self._process_audio_chunk(samples, chunk_start_time, chunk_duration)
+                self._process_audio_chunk(
+                    samples, captured_samples / float(self.vad_sample_rate),
+                    len(samples) / float(self.vad_sample_rate),
+                )
+                captured_samples += len(samples)
         except Exception as e:
             logger.error(f"[record] Error in audio stream worker: {e}", exc_info=True)
         finally:
             self._finalize_segment()
+
+    def _enqueue_speech_segment(self, segment: np.ndarray):
+        start = self.speech_start_time if self.speech_start_time is not None else 0.0
+        self.transcription_queue.put(_StreamingChunk(
+            segment, start, max(start, self.speech_end_time),
+        ))
 
     def _reset_speech_mode(self):
         self.in_speech = False
@@ -1936,9 +1960,9 @@ class StreamingDictation(Dictation):
             has_speech = False
         # Handle frame data.
         if has_speech:
-            if self.in_speech:
-                self.speech_end_time = frame_start_time + frame_duration
-            else:
+            # Include the first accepted speech frame, before in_speech becomes true.
+            self.speech_end_time = frame_start_time + frame_duration
+            if not self.in_speech:
                 segment_length = len(self.speech_segment_chunks)
                 # Check it is the first speech chunk.
                 if segment_length == 0:
@@ -1970,7 +1994,7 @@ class StreamingDictation(Dictation):
                 segment_duration = len(segment) / float(self.vad_sample_rate)
                 logger.info(f"[SAD] {frame_start_time:.3f} speech finished ({self.speech_end_time:.3f}s ago), handling chunk of {segment_duration:.3f} seconds audio")
                 # Send complete segment to transcription queue
-                self.transcription_queue.put(segment)
+                self._enqueue_speech_segment(segment)
                 if not self.file_mode and self.config.get("save_recordings", False):
                     self.file_saving_queue.put((segment, self.vad_sample_rate))
                 self._reset_speech_mode()
@@ -1994,7 +2018,7 @@ class StreamingDictation(Dictation):
             # Log finalization.
             logger.info(f"[SAD] {current_in_segment_time:.3f} speech finished (forced), handling chunk of {segment_audio_duration:.3f} seconds audio")
             # Send complete segment to transcription queue.
-            self.transcription_queue.put(segment)
+            self._enqueue_speech_segment(segment)
             # Save segment to file if needed.
             if not self.file_mode and self.config.get("save_recordings", False):
                 self.file_saving_queue.put((segment, self.vad_sample_rate))
@@ -2003,21 +2027,36 @@ class StreamingDictation(Dictation):
     def _transcription_worker(self):
         """Transcription worker thread - processes chunks in order."""
         chunk_idx = 0
+        # Worker-local history starts fresh for each live/file session.
+        recent_text = ""
+        previous_language = None
+        previous_speech_end = None
         # FYI: continue during "stopping" state to process all remaining items before exiting.
         while self.recording or self.stopping or not self.transcription_queue.empty():
             try:
-                segment: np.ndarray | None = self.transcription_queue.get(timeout=0.1)
-                if segment is None:
+                chunk: _StreamingChunk | None = self.transcription_queue.get(timeout=0.1)
+                if chunk is None:
                     # If we're stopping and there might be more segments, continue processing
                     # This handles the race condition where None is added before the final segment
                     if self.stopping and not self.transcription_queue.empty():
                         continue
                     break
+                if (
+                    previous_speech_end is not None
+                    and chunk.speech_start - previous_speech_end >= _STREAMING_CONTEXT_RESET_S
+                ):
+                    recent_text = ""
+                    previous_language = None
+                    logger.debug("[transcriber] Cleared text context after speech pause")
+                previous_speech_end = chunk.speech_end
+                segment = chunk.audio
                 if self.model is None:
+                    recent_text = ""
                     logger.error("[transcriber] Model not loaded")
                     continue
                 # Check if segment is all zeros or effectively silent (audio input problem)
                 if self._check_valid_audio_input(segment):
+                    recent_text = ""
                     continue
                 # Convert int16 to float32 and normalize to [-1.0, 1.0]
                 if segment.dtype == np.int16:
@@ -2034,7 +2073,26 @@ class StreamingDictation(Dictation):
                         lang = resolve_transcription_language(self.model, segment, configured_lang, allowlist)
                 else:
                     lang = resolve_transcription_language(self.model, segment, configured_lang, allowlist)
-                segments, _ = self.model.transcribe(
+                # With unrestricted auto detection, resolve the new chunk's language
+                # before supplying history so a switch cannot inherit the old prompt.
+                if recent_text and lang is None:
+                    try:
+                        lang, _, _ = self.model.detect_language(
+                            segment, vad_filter=True,
+                            vad_parameters=VadOptions(**_STREAMING_VAD_PARAMETERS),
+                        )
+                    except Exception:
+                        recent_text = ""
+                        logger.warning("[transcriber] Could not resolve context language", exc_info=True)
+                if lang != previous_language:
+                    recent_text = ""
+                prompt_kwargs = dict(self.custom_terms_kwargs)
+                if recent_text:
+                    glossary = prompt_kwargs.get("initial_prompt", "")
+                    prompt_kwargs["initial_prompt"] = (
+                        glossary + "\n" + recent_text if glossary else recent_text
+                    )
+                segments, info = self.model.transcribe(
                     segment,
                     # Second VAD pass with options tuned for short clips (see _STREAMING_VAD_PARAMETERS).
                     vad_filter=True,
@@ -2045,11 +2103,13 @@ class StreamingDictation(Dictation):
                     language=lang,
                     condition_on_previous_text=True,
                     without_timestamps=True,
-                    **self.custom_terms_kwargs,
+                    **prompt_kwargs,
                 )
+                previous_language = lang or getattr(info, "language", None)
                 text = _streaming_segments_to_text(segments)
                 trans_duration = time.monotonic() - trans_start
                 if not text:
+                    recent_text = ""
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
                     continue
                 if self.should_reject_text(text):
@@ -2057,6 +2117,8 @@ class StreamingDictation(Dictation):
                     continue
                 else:
                     logger.info(f"[transcriber] Transcribed {len(segment) / float(self.vad_sample_rate):.2f}s in {trans_duration:.2f}s: {text}")
+                # Only accepted output becomes prompt context, never glossary text.
+                recent_text = " ".join((recent_text + " " + text).split()[-_STREAMING_CONTEXT_WORDS:])
                 # Add space before chunk if it's not the first one
                 if chunk_idx > 0:
                     text = " " + text
@@ -2067,6 +2129,8 @@ class StreamingDictation(Dictation):
             except queue.Empty:
                 continue
             except Exception as e:
+                recent_text = ""
+                previous_language = None
                 logger.error(f"[transcriber] {e}", exc_info=True)
 
     def _typing_worker(self):

@@ -142,6 +142,19 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 | **Streaming** | `--streaming` / `default_streaming = true` | Press hotkey to start, press again to stop. Silence (VAD) splits speech into chunks; each chunk is transcribed and inserted as you go — this is the speak+type flow. |
 | **Non-streaming (push-to-talk)** | `--no-streaming` / `default_streaming = false` | Hold hotkey to record, release to transcribe the whole buffer once, then clipboard + type. Better for short precise utterances; held keys can misbehave in some terminals/apps. |
 
+Streaming automatically supplies up to the last 50 words of accepted transcription
+as context for the next chunk, alongside your glossary. It clears this recent text
+at each new session, after at least five seconds without speech, and when the
+selected language changes. The pause uses captured speech timestamps, so a slow
+decoder does not cause a reset. It does not wait for more audio or insert previous
+text again; the extra computation can increase inference time. When unrestricted automatic
+language detection is in use, chunks with recent context resolve their language
+before decoding so a switch can clear that context.
+
+For corrections, pause for five seconds or stop and restart dictation to clear
+context. Moving the cursor by itself is not detected, and an immediate correction
+can still be influenced by earlier text. The glossary remains active after resets.
+
 Default hotkey is **F12** (configurable). Ctrl+C quits a foreground process.
 
 ---
