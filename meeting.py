@@ -66,11 +66,16 @@ SILENCE_STOP_S = 600.0
 # so a speech run longer than this is split: otherwise a long monologue would be
 # locked to whatever language its first 30s scored.
 LANGUAGE_WINDOW_S = 30.0
+# Context is only a fallback for uncertain scores, never a language lock.
+LANGUAGE_CONTEXT_MAX_GAP_S = 2.0
+LANGUAGE_MIN_PROBABILITY = 0.35
+LANGUAGE_MIN_SHARE = 0.80
 # Silero VAD settings for cutting a track into speech runs. faster-whisper's own
 # default silence gap is 2000ms, long enough to swallow a whole turn change -- and
-# with it a language switch -- into one run. 700ms still keeps a sentence's internal
-# pauses together while separating one utterance from the next.
-RUN_MIN_SILENCE_MS = 700
+# with it a language switch -- into one run. 1200ms keeps more sentence fragments
+# together: on a scored question, joining an 800ms pause reduced 13 word edits to 4.
+# The 30s run cap still bounds how long a run can use one detected language.
+RUN_MIN_SILENCE_MS = 1200
 # Padding restored around each run so the decoder hears the attack of the first word
 # and the tail of the last; VAD boundaries sit tight against the speech itself.
 RUN_PAD_MS = 200
@@ -410,7 +415,7 @@ def speech_runs(
 ) -> list[tuple[int, int]]:
     """Sample spans of actual speech, as (start, end) pairs.
 
-    Everything between the spans is silence and is never handed to Whisper, which
+    Everything between the spans is silence and is never decoded as text. Whisper
     invents training-data text ("Редактор субтитров ...", "Thanks for watching!")
     when asked to transcribe nothing. This silero VAD is a stricter guard than the
     webrtcvad ratio it replaced: webrtcvad scored broadband noise 0.9+, silero
@@ -448,26 +453,17 @@ def transcribe_runs(
     progress=None,
     find_runs=None,
 ) -> list[Cue]:
-    """Transcribe one speech run at a time, with the language detected per run.
+    """Decode each speech run independently, resolving uncertain language scores
+    with up to 30 seconds of nearby same-track audio.
 
-    Fixed 30s windows were wrong twice over. A window holding two languages was
-    decoded entirely in whichever one dominated its language score, so the other
-    speaker's phrase vanished -- measured on a real track: an English sentence at
-    2.8s was lost because Russian later in the same window scored 0.91. And because
-    the window began in silence, Whisper stretched its segment back to the window
-    start, stamping speech that happened at 10s as 00:00:00.
+    Confident run-local evidence wins even when neighboring speech uses another
+    language. Context stops at long pauses and is used only for language detection:
+    decoding, cue offsets, and word timestamps retain the original run boundaries.
+    No language state is shared between runs or tracks.
 
-    Cutting on speech boundaries fixes both: each utterance is scored on its own
-    audio, and a cue's time comes from the run's true offset rather than from a
-    timestamp token Whisper chose over a silent lead-in.
-
-    `allowlist` filters the language scores, which also rejects nonsense winners:
-    short or noisy runs often score highest on languages like "la" that are not
-    plausibly in the call. `progress(done, total)` is called once per run.
-    `settings` carries the [meeting] tunables. `transcribe_kwargs` is passed straight
-    to Whisper -- the custom_terms glossary rides in here, which is what turns
-    "sync 8 group" into "sync.WaitGroup". `find_runs` is injectable so tests can pin
-    the segmentation.
+    `allowlist` filters language candidates. `progress(done, total)` runs once per
+    speech run; `transcribe_kwargs` forwards the shared glossary to the decoder.
+    `find_runs` is injectable so tests can pin the segmentation.
     """
     settings = settings or RunSettings()
     detect = find_runs or speech_runs
@@ -479,7 +475,8 @@ def transcribe_runs(
     for index, (start, end) in enumerate(runs, 1):
         chunk = audio[start:end]
         offset, limit = start / sample_rate, end / sample_rate
-        lang = _detect_window_language(model, chunk, allowlist)
+        context = _language_context(audio, runs, index - 1, sample_rate)
+        lang = _detect_window_language(model, chunk, allowlist, context=context)
         logger.info(
             "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset, lang
         )
@@ -515,20 +512,80 @@ def transcribe_runs(
     return cues
 
 
-def _detect_window_language(model, chunk: np.ndarray, allowlist: list[str] | None):
+def _language_context(audio, runs, index: int, sample_rate: int) -> np.ndarray:
+    """A centered, bounded audio view within the current cluster of speech runs."""
+    start, end = runs[index]
+    window = int(LANGUAGE_WINDOW_S * sample_rate)
+    if end - start >= window:
+        return audio[start:end]
+    center = (start + end) // 2
+    left, right = max(0, center - window // 2), center + window // 2
+    gap = int(LANGUAGE_CONTEXT_MAX_GAP_S * sample_rate)
+    first = last = index
+    while first > 0:
+        _, prev_end = runs[first - 1]
+        if prev_end <= left or runs[first][0] - prev_end > gap:
+            break
+        first -= 1
+    while last + 1 < len(runs):
+        next_start, _ = runs[last + 1]
+        if next_start >= right or next_start - runs[last][1] > gap:
+            break
+        last += 1
+    return audio[max(left, runs[first][0]):min(right, runs[last][1])]
+
+
+def _language_evidence(model, chunk: np.ndarray, allowlist: list[str] | None):
+    """Return the selected language and whether its acoustic evidence is strong.
+
+    Absolute probability prevents a tiny allowlisted winner from seeming certain
+    after filtering out other languages. Relative share rejects close contests.
+    These conservative heuristics are not calibrated recognition probabilities.
+    """
     try:
-        detected, _, all_probs = model.detect_language(
+        detected, probability, all_probs = model.detect_language(
             chunk, vad_filter=False, language_detection_segments=1
         )
     except Exception as e:
-        logger.warning("Language detection failed (%s); letting Whisper decide", e)
-        return None
-    if not allowlist:
-        return detected
-    allowed = [(lang, p) for lang, p in all_probs if lang in allowlist]
-    if not allowed:
-        return allowlist[0]
-    return max(allowed, key=lambda pair: pair[1])[0]
+        logger.warning("Language detection failed (%s)", e)
+        return None, False
+    candidates = [
+        (lang, p) for lang, p in all_probs if not allowlist or lang in allowlist
+    ]
+    if allowlist:
+        if not candidates:
+            return allowlist[0], False
+        detected, probability = max(candidates, key=lambda pair: pair[1])
+    mass = sum(p for _, p in candidates)
+    confident = (
+        probability >= LANGUAGE_MIN_PROBABILITY
+        and mass > 0
+        and probability / mass >= LANGUAGE_MIN_SHARE
+    )
+    return detected, confident
+
+
+def _detect_window_language(
+    model,
+    chunk: np.ndarray,
+    allowlist: list[str] | None,
+    context: np.ndarray | None = None,
+):
+    language, confident = _language_evidence(model, chunk, allowlist)
+    if confident or context is None or len(context) <= len(chunk):
+        return language
+    contextual_language, contextual_confident = _language_evidence(
+        model, context, allowlist
+    )
+    if contextual_confident:
+        logger.info(
+            "Language context resolved uncertain run: %s -> %s",
+            language, contextual_language,
+        )
+        return contextual_language
+    # Weak context must not force a switch. None delegates to decoder detection
+    # when the run-local detector failed too.
+    return language
 
 
 def _write_srt(cues: list[Cue], path: Path) -> None:
@@ -606,8 +663,8 @@ def _publish_progress(dictation, track: str | None, done: int, total: int) -> No
 def finish_session(dictation, session_dir: Path, transcript_dir: Path) -> Path:
     """Transcribe a finished session and write the merged Markdown transcript.
 
-    Language is re-detected every 30s window, because a call can switch languages and
-    whole-file detection would lock the whole track to whatever the first window was.
+    Language is detected per speech run, with surrounding same-track audio used
+    to resolve uncertain scores. Each run is decoded at its original offset.
 
     The transcript is written to transcript_dir (kept) and beside the audio in the
     session directory. The WAVs are deleted only after the transcript is safely on
