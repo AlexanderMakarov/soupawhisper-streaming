@@ -72,9 +72,10 @@ LANGUAGE_MIN_PROBABILITY = 0.35
 LANGUAGE_MIN_SHARE = 0.80
 # Silero VAD settings for cutting a track into speech runs. faster-whisper's own
 # default silence gap is 2000ms, long enough to swallow a whole turn change -- and
-# with it a language switch -- into one run. 700ms still keeps a sentence's internal
-# pauses together while separating one utterance from the next.
-RUN_MIN_SILENCE_MS = 700
+# with it a language switch -- into one run. 1200ms keeps more sentence fragments
+# together: on a scored question, joining an 800ms pause reduced 13 word edits to 4.
+# The 30s run cap still bounds how long a run can use one detected language.
+RUN_MIN_SILENCE_MS = 1200
 # Padding restored around each run so the decoder hears the attack of the first word
 # and the tail of the last; VAD boundaries sit tight against the speech itself.
 RUN_PAD_MS = 200

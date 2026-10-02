@@ -199,9 +199,11 @@ Progress goes to `transcribe.log` in the session directory — one line per spee
 
 **Tuning.** Set `keep_audio = true`, record a sample, then re-run the same WAVs with different values and compare — `transcribe.log` shows what each run was detected as.
 
+The default speech pause is 1,200 ms, keeping more sentence fragments in one decoding call. Longer runs can also combine a brief language change; lower `run_min_silence_ms` if you need finer language boundaries. Existing explicit configuration values override the default.
+
 | Setting | Default | Raise it to… | Lower it to… |
 |---|---|---|---|
-| `run_min_silence_ms` | `700` | keep a sentence's pauses in one run | let the language switch more often |
+| `run_min_silence_ms` | `1200` | keep a sentence's pauses in one run | let the language switch more often |
 | `run_pad_ms` | `200` | stop clipped first/last words | keep neighbouring noise out |
 | `run_vad_threshold` | `0.5` | admit only clear speech | catch quiet or distant talk |
 | `run_min_speech_ms` | `0` | drop coughs and clicks | keep one-word answers |
