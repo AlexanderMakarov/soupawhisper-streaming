@@ -48,3 +48,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# Local experiments and their artifacts
+spikes/

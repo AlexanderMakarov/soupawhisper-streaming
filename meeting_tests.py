@@ -1154,3 +1154,152 @@ class TestFrontmatter:
         )
 
         assert out.read_text().startswith("---\n")
+
+
+class ContextLanguageModel(RunModel):
+    """Script detector evidence independently of decoder calls."""
+
+    def __init__(self, evidence):
+        super().__init__()
+        self.evidence = iter(evidence)
+        self.detected_audio = []
+        self.decoded_audio = []
+
+    def detect_language(self, audio, **kw):
+        self.detected_audio.append(audio.copy())
+        result = next(self.evidence)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def transcribe(self, audio, **kw):
+        self.decoded_audio.append(audio.copy())
+        return super().transcribe(audio, **kw)
+
+
+def language_scores(language, probability, other_probability):
+    other = 'ru' if language == 'en' else 'en'
+    return language, probability, [(language, probability), (other, other_probability)]
+
+
+class TestSurroundingLanguageDetection:
+    @pytest.mark.parametrize('language,wrong', [('en', 'ru'), ('ru', 'en')])
+    def test_context_repairs_uncertain_run_without_changing_decode_audio_or_offsets(self, language, wrong):
+        model = ContextLanguageModel([
+            language_scores(language, .9, .05),
+            language_scores(wrong, .117, .101),
+            language_scores(language, .8, .1),
+        ])
+        audio = np.arange(10 * 16000, dtype=np.float32)
+        seen = []
+
+        cues = meeting.transcribe_runs(
+            model, audio, allowlist=['en', 'ru'],
+            find_runs=runs_at((1, 4), (5, 7)),
+            progress=lambda done, total: seen.append((done, total)),
+        )
+
+        assert model.calls == [language, language]
+        np.testing.assert_array_equal(model.detected_audio[-1], audio[16000:7 * 16000])
+        np.testing.assert_array_equal(model.decoded_audio[-1], audio[5 * 16000:7 * 16000])
+        assert [cue.start for cue in cues] == [1.5, 5.5]
+        assert seen == [(1, 2), (2, 2)]
+
+    @pytest.mark.parametrize('languages', [('en', 'ru', 'en'), ('ru', 'en', 'ru')])
+    def test_confident_short_switches_do_not_consult_surrounding_speech(self, languages):
+        model = ContextLanguageModel([language_scores(lang, .9, .05) for lang in languages])
+        audio = np.zeros(10 * 16000, dtype=np.float32)
+
+        meeting.transcribe_runs(model, audio, allowlist=['en', 'ru'],
+                               find_runs=runs_at((1, 3), (4, 4.5), (5, 7)))
+
+        assert model.calls == list(languages)
+        assert [len(a) for a in model.detected_audio] == [32000, 8000, 32000]
+
+    def test_low_absolute_allowlisted_probability_still_uses_context(self):
+        model = ContextLanguageModel([
+            ('uk', .6, [('uk', .6), ('ru', .148), ('en', .034)]),
+            language_scores('en', .8, .1),
+        ])
+
+        lang = meeting._detect_window_language(model, np.zeros(100), ['en', 'ru'],
+                                               context=np.zeros(1000))
+
+        assert lang == 'en'
+        assert len(model.detected_audio) == 2
+
+    def test_close_high_probability_contest_uses_context(self):
+        model = ContextLanguageModel([language_scores('ru', .5, .45),
+                                      language_scores('en', .8, .1)])
+        assert meeting._detect_window_language(model, np.zeros(100), ['en', 'ru'],
+                                                context=np.zeros(1000)) == 'en'
+
+    @pytest.mark.parametrize('context_result', [language_scores('en', .2, .15), RuntimeError('context failed')])
+    def test_weak_or_failed_context_preserves_local_choice(self, context_result):
+        model = ContextLanguageModel([language_scores('ru', .117, .101), context_result])
+        assert meeting._detect_window_language(model, np.zeros(100), ['en', 'ru'],
+                                                context=np.zeros(1000)) == 'ru'
+
+    def test_failed_local_detection_can_recover_from_context(self):
+        model = ContextLanguageModel([RuntimeError('local failed'), language_scores('ru', .8, .1)])
+        assert meeting._detect_window_language(model, np.zeros(100), ['en', 'ru'],
+                                                context=np.zeros(1000)) == 'ru'
+
+    def test_both_detector_failures_delegate_to_decoder(self):
+        model = ContextLanguageModel([RuntimeError('local failed'), RuntimeError('context failed')])
+        assert meeting._detect_window_language(model, np.zeros(100), ['en', 'ru'],
+                                                context=np.zeros(1000)) is None
+
+    def test_context_also_respects_allowlist(self):
+        model = ContextLanguageModel([
+            language_scores('en', .2, .15),
+            ('uk', .6, [('uk', .6), ('ru', .36), ('en', .04)]),
+        ])
+        assert meeting._detect_window_language(model, np.zeros(100), ['en', 'ru'],
+                                                context=np.zeros(1000)) == 'ru'
+
+    def test_context_works_without_an_allowlist(self):
+        model = ContextLanguageModel([language_scores('ru', .2, .15), language_scores('en', .9, .05)])
+        assert meeting._detect_window_language(model, np.zeros(100), None,
+                                                context=np.zeros(1000)) == 'en'
+
+    def test_isolated_run_does_not_retry_detection(self):
+        model = ContextLanguageModel([language_scores('ru', .117, .101)])
+        meeting.transcribe_runs(model, np.zeros(20 * 16000, dtype=np.float32),
+                               find_runs=runs_at((5, 7)))
+        assert model.calls == ['ru']
+        assert len(model.detected_audio) == 1
+
+    def test_language_is_not_carried_between_tracks(self):
+        model = ContextLanguageModel([language_scores('en', .9, .05),
+                                      language_scores('ru', .117, .101)])
+        for _ in range(2):
+            meeting.transcribe_runs(model, np.zeros(10 * 16000, dtype=np.float32),
+                                   find_runs=runs_at((1, 3)))
+        assert model.calls == ['en', 'ru']
+
+
+class TestLanguageContextBounds:
+    def test_context_stops_at_long_pauses_on_both_sides(self):
+        audio = np.arange(300, dtype=np.float32)
+        runs = [(0, 20), (50, 70), (80, 100), (130, 150)]
+        # Sample rate 10: three-second gaps must separate clusters.
+        np.testing.assert_array_equal(meeting._language_context(audio, runs, 1, 10), audio[50:100])
+        np.testing.assert_array_equal(meeting._language_context(audio, runs, 2, 10), audio[50:100])
+
+    def test_context_is_centered_and_capped_at_thirty_seconds(self):
+        audio = np.arange(600, dtype=np.float32)
+        runs = [(s, s + 10) for s in range(0, 600, 20)]
+        np.testing.assert_array_equal(meeting._language_context(audio, runs, 15, 10), audio[160:450])
+
+    @pytest.mark.parametrize('index,expected', [(0, (0, 150)), (29, (440, 590))])
+    def test_track_edges_are_clipped_to_speech(self, index, expected):
+        audio = np.arange(600, dtype=np.float32)
+        runs = [(s, s + 10) for s in range(0, 600, 20)]
+        np.testing.assert_array_equal(meeting._language_context(audio, runs, index, 10),
+                                      audio[expected[0]:expected[1]])
+
+    def test_full_window_run_needs_no_extra_context(self):
+        audio = np.arange(600, dtype=np.float32)
+        runs = [(0, 300), (300, 600)]
+        np.testing.assert_array_equal(meeting._language_context(audio, runs, 0, 10), audio[:300])

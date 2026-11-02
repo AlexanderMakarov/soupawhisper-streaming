@@ -193,15 +193,17 @@ Progress goes to `transcribe.log` in the session directory — one line per spee
 
 ### Quality
 
-**What works.** Each track is cut into speech runs and the language is detected per run, so a call that switches languages decodes correctly and timestamps land on real speech. Set `language_allowlist` (e.g. `en, ru`) to keep detection between plausible languages; short or noisy runs otherwise score highest on things like `la`. Silence is never sent to Whisper, and low-confidence output is dropped — together these stop the invented text Whisper produces when it has nothing to hear (`Thanks for watching!`, subtitle-translator credits).
+**What works.** Each track is cut into speech runs and decoded at its original timestamps. Language detection first checks each run; when its scores are uncertain, it automatically checks up to 30 seconds of surrounding same-track audio within pauses of at most two seconds. Confident run-local language decisions take priority, including short replies in another language. This requires no additional configuration. Set `language_allowlist` (e.g. `en, ru`) to keep detection between plausible languages; short or noisy runs otherwise score highest on things like `la`. Only speech runs are decoded as text, and low-confidence output is dropped — together these stop the invented text Whisper produces when it has nothing to hear (`Thanks for watching!`, subtitle-translator credits).
 
-**What does not.** Strongly accented speech is sometimes detected as the wrong language and comes back as phonetic nonsense; on one 73-minute interview this hit 9% of runs. A larger model detects better if you can afford the decode time. Long monologues split every `run_max_seconds`, so a language change inside one is only caught at that boundary.
+**What does not.** Strongly accented speech is sometimes detected as the wrong language and comes back as phonetic nonsense; on one 73-minute interview this hit 9% of runs. Surrounding speech can help uncertain language detection, but brief, ambiguous language switches can still be misclassified; context is not proof of the run's language. Long monologues split every `run_max_seconds`, so a language change inside one is only caught at that boundary.
 
 **Tuning.** Set `keep_audio = true`, record a sample, then re-run the same WAVs with different values and compare — `transcribe.log` shows what each run was detected as.
 
+The default speech pause is 1,200 ms, keeping more sentence fragments in one decoding call. Longer runs can also combine a brief language change; lower `run_min_silence_ms` if you need finer language boundaries. Existing explicit configuration values override the default.
+
 | Setting | Default | Raise it to… | Lower it to… |
 |---|---|---|---|
-| `run_min_silence_ms` | `700` | keep a sentence's pauses in one run | let the language switch more often |
+| `run_min_silence_ms` | `1200` | keep a sentence's pauses in one run | let the language switch more often |
 | `run_pad_ms` | `200` | stop clipped first/last words | keep neighbouring noise out |
 | `run_vad_threshold` | `0.5` | admit only clear speech | catch quiet or distant talk |
 | `run_min_speech_ms` | `0` | drop coughs and clicks | keep one-word answers |
