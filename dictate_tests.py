@@ -467,9 +467,17 @@ class TestDictation:
         assert isinstance(config["default_streaming"], bool)
         assert config["clipboard"] is True
 
-    def test_language_defaults_to_en(self, mock_config):
+    def test_language_defaults_to_auto(self, mock_config):
         config = dictate.load_config()
-        assert config["language"] == "en"
+        assert config["language"] is None
+
+    def test_enforce_language_from_layout_defaults_to_true(self, mock_config):
+        config = dictate.load_config()
+        assert config["enforce_language_from_layout"] is True
+
+    def test_model_defaults_to_multilingual_base(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(dictate, "CONFIG_PATH", tmp_path / "missing.ini")
+        assert dictate.load_config()["model"] == "base"
 
     def test_language_auto_maps_to_none(self, mock_config):
         content = mock_config.read_text()
@@ -526,6 +534,23 @@ class TestDictation:
         assert parsed["com.apple.keylayout.US"] == "en"
         assert parsed["com.apple.keylayout.Russian"] == "ru"
         assert parsed["xkb"] == "de:de"
+
+    @pytest.mark.parametrize("layout, expected", [
+        ("us", "en"), ("gb", "en"), ("ua", "uk"), ("ru", "ru"), ("de", "de"), ("xx", None),
+        ("br", "pt"), ("si", "sl"), ("be", None), ("ca", None),
+    ])
+    def test_linux_layout_language_defaults_without_user_map(self, monkeypatch, layout, expected):
+        """Layout codes that are not Whisper language codes must never reach the decoder."""
+        monkeypatch.setattr(dictate, "IS_MACOS", False)
+        monkeypatch.setattr(dictate, "detect_current_keyboard_layout", lambda: layout)
+        monkeypatch.setattr(dictate, "_linux_active_xkb_layout", lambda: layout)
+        lang_map = dictate.Dictation._parse_layout_to_language_map("")
+        assert dictate.detect_current_keyboard_language(lang_map) == expected
+
+    def test_user_layout_map_overrides_builtin_defaults(self):
+        parsed = dictate.Dictation._parse_layout_to_language_map("us:ru")
+        assert parsed["us"] == "ru"
+        assert parsed["gb"] == "en"
 
     def test_language_from_layout_direct_and_heuristic(self):
         m = {"com.apple.keylayout.US": "en"}
@@ -1820,13 +1845,24 @@ class TestFileTranscriptionLanguage(NoBackgroundModelLoad):
         return d, wav
 
     def test_default_still_locks_one_language_for_dictation(self, mock_config, tmp_path):
+        # Default language=auto: Whisper detects once per file, never per segment.
         d, wav = self._dictation_with_wav(tmp_path)
 
         d.transcribe_file_to_output(str(wav), str(tmp_path / "out.srt"))
 
         _, kwargs = d.model.transcribe_calls[-1]
         assert not kwargs.get("multilingual")
-        assert kwargs["language"] is not None
+
+    def test_configured_language_is_passed_for_dictation(self, mock_config, tmp_path):
+        mock_config.write_text(mock_config.read_text().replace(
+            "[whisper]", "[whisper]\nlanguage = ru"
+        ))
+        d, wav = self._dictation_with_wav(tmp_path)
+
+        d.transcribe_file_to_output(str(wav), str(tmp_path / "out.srt"))
+
+        _, kwargs = d.model.transcribe_calls[-1]
+        assert kwargs["language"] == "ru"
 
 
 class TestFileModeSkipsPynput(NoBackgroundModelLoad):
@@ -2254,10 +2290,10 @@ class TestStreamingSpeechTimestamps:
 
 
 class TestStreamingContextConfiguration:
-    def test_defaults_preserve_the_original_context_behavior(self, mock_config):
+    def test_defaults_keep_context_across_short_pauses(self, mock_config):
         config = dictate.load_config()
         assert config['streaming_context_words'] == 50
-        assert config['streaming_context_reset_seconds'] == 5.0
+        assert config['streaming_context_reset_seconds'] == 10.0
 
     def test_reads_both_streaming_overrides(self, mock_config):
         mock_config.write_text(mock_config.read_text().replace(
@@ -2300,9 +2336,10 @@ class TestStreamingContextConfiguration:
 
     @pytest.mark.parametrize('reset_seconds,keeps_context', [(2, False), (10, True), (0, False)])
     def test_custom_reset_interval_is_used_by_the_worker(self, mock_config, reset_seconds, keeps_context):
+        # Fixed language isolates the pause reset from language-change resets.
         mock_config.write_text(mock_config.read_text().replace(
             '[streaming]', f'[streaming]\ncontext_reset_seconds = {reset_seconds}'
-        ))
+        ).replace('[whisper]', '[whisper]\nlanguage = en'))
         helper = TestStreamingTextContext()
         d = helper.make_worker(['First.', 'Second.'])
         d.config.update(dictate.load_config())

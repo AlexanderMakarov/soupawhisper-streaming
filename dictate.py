@@ -31,6 +31,10 @@ import webrtcvad
 import meeting as meeting_mod
 
 from faster_whisper import WhisperModel
+try:
+    from faster_whisper.tokenizer import _LANGUAGE_CODES as WHISPER_LANGUAGE_CODES
+except ImportError:  # private name; keep the app importable if a release renames it
+    WHISPER_LANGUAGE_CODES = ("en", "ru", "uk", "de", "fr", "es", "it", "pt", "pl")
 
 
 def _import_keyboard():
@@ -423,6 +427,35 @@ def _linux_active_xkb_layout() -> Optional[str]:
     return layouts[idx]
 
 
+# Keyboard layout ids whose name is not the Whisper language code. User
+# `layout_to_language` entries override these. Several XKB country ids are a
+# *different* Whisper language (br = Breton, si = Sinhala), so they are mapped
+# here; None means the layout names no single language, so Whisper detects it.
+DEFAULT_LAYOUT_TO_LANGUAGE: dict[str, Optional[str]] = {
+    "us": "en",
+    "gb": "en",
+    "eu": "en",
+    "ua": "uk",
+    "br": "pt",
+    "si": "sl",
+    "ba": "bs",
+    "am": "hy",
+    "et": "am",
+    "la": "lo",
+    "my": "ms",
+    "be": None,
+    "ca": None,
+    "af": None,
+    "ml": None,
+    "sn": None,
+    "com.apple.keylayout.US": "en",
+    "com.apple.keylayout.ABC": "en",
+    "com.apple.keylayout.British": "en",
+    "com.apple.keylayout.Russian": "ru",
+    "com.apple.keylayout.Ukrainian": "uk",
+}
+
+
 def detect_current_keyboard_language(layout_to_language: dict[str, str]) -> Optional[str]:
     """
     Robustly detect current "language expectation" from the OS keyboard input source.
@@ -433,13 +466,12 @@ def detect_current_keyboard_language(layout_to_language: dict[str, str]) -> Opti
     3) Linux/X11: read active XKB layout (xkb-switch, xkblayout-state, or X11 XkbGetState); return if mapped or ISO 639-1
     """
     def looks_like_iso_639_1(s: str) -> bool:
-        return len(s) == 2 and s.isalpha()
+        # Only codes Whisper can decode; e.g. layout "us" is not a language.
+        return s in WHISPER_LANGUAGE_CODES
 
     layout_id = detect_current_keyboard_layout()
-    if layout_id:
-        mapped = layout_to_language.get(layout_id)
-        if mapped:
-            return mapped
+    if layout_id and layout_id in layout_to_language:
+        return layout_to_language[layout_id]
 
     if IS_MACOS:
         if not layout_id:
@@ -453,9 +485,8 @@ def detect_current_keyboard_language(layout_to_language: dict[str, str]) -> Opti
     active = _linux_active_xkb_layout()
     if not active:
         return None
-    mapped = layout_to_language.get(active)
-    if mapped:
-        return mapped
+    if active in layout_to_language:
+        return layout_to_language[active]
     active = active.strip().lower()
     return active if looks_like_iso_639_1(active) else None
 
@@ -476,8 +507,8 @@ def load_config():
     if CONFIG_PATH.exists():
         config.read(CONFIG_PATH)
 
-    language_raw = config.get("whisper", "language", fallback="en").strip().lower()
-    language = None if language_raw in {"auto", "none"} else (language_raw or "en")
+    language_raw = config.get("whisper", "language", fallback="auto").strip().lower()
+    language = None if language_raw in {"auto", "none", ""} else language_raw
 
     allow_raw = config.get("whisper", "language_allowlist", fallback="").strip()
     language_allowlist: Optional[list[str]] = None
@@ -494,7 +525,7 @@ def load_config():
         "streaming", "context_words", fallback=50
     )
     context_reset_seconds = config.getfloat(
-        "streaming", "context_reset_seconds", fallback=5.0
+        "streaming", "context_reset_seconds", fallback=10.0
     )
     if context_words < 0:
         raise ValueError("[streaming] context_words must be non-negative (0 disables text context)")
@@ -503,7 +534,7 @@ def load_config():
 
     return {
         # Whisper
-        "model": config.get("whisper", "model", fallback="base.en"),
+        "model": config.get("whisper", "model", fallback="base"),
         "device": config.get("whisper", "device", fallback="cpu"),
         "compute_type": config.get("whisper", "compute_type", fallback="int8"),
         "language": language,
@@ -529,7 +560,7 @@ def load_config():
         # initial_prompt + hotwords. Comma-separated; empty disables the feature.
         "custom_terms": config.get("behavior", "custom_terms", fallback="").strip(),
         # Language enforcement (optional): use current OS keyboard layout as the "field expectation"
-        "enforce_language_from_layout": config.getboolean("behavior", "enforce_language_from_layout", fallback=False),
+        "enforce_language_from_layout": config.getboolean("behavior", "enforce_language_from_layout", fallback=True),
         # Comma-separated list: "<layout_id>:<lang>,<layout_id>:<lang>"
         "layout_to_language": config.get("behavior", "layout_to_language", fallback="").strip(),
         # Menu bar / system tray (default on; if true and tray cannot start, process exits)
@@ -1077,7 +1108,7 @@ class Dictation:
         Parse `behavior.layout_to_language` config into a dict.
         Format: "<layout_id>:<lang>, <layout_id>:<lang>".
         """
-        out: dict[str, str] = {}
+        out: dict[str, Optional[str]] = dict(DEFAULT_LAYOUT_TO_LANGUAGE)
         if not raw:
             return out
         for part in raw.split(","):
