@@ -112,7 +112,7 @@ Same targets map to `systemctl --user` (Linux) or the LaunchAgent / `~/Library/L
 
 Edit `~/.config/soupawhisper/config.ini` (comments in the file are authoritative). Highlights:
 
-**Language** — ISO 639-1 codes. Non-English or `auto` needs a **multilingual** model (name **without** `.en`, e.g. `base`). English-only: `base.en` + `language = en`. Mixed / bilingual:
+**Language** — ISO 639-1 codes. Defaults: `model = base`, `language = auto`, `enforce_language_from_layout = true` and `layout_to_language = us:en, com.apple.keylayout.US:en`, so the keyboard layout chooses the language when a session starts and Whisper detects it when the layout is unmapped or unreadable. Non-English or `auto` needs a **multilingual** model (name **without** `.en`, e.g. `base`). English-only: `base.en` + `language = en` (a fixed language ignores the layout). Mixed / bilingual:
 
 ```ini
 [whisper]
@@ -125,7 +125,7 @@ enforce_language_from_layout = true
 layout_to_language = us:en, ru:ru, com.apple.keylayout.US:en, com.apple.keylayout.Russian:ru
 ```
 
-Layout language is captured **once at hotkey press** for the session. On Linux, active layout uses `xkb-switch` / `xkblayout-state` if present, else X11 `XkbGetState` + `setxkbmap`. Map `us` → `en`. Allowlist detection still runs Whisper’s normal language scores and **filters** them — not a second full decode; one language in config/allowlist skips detect entirely.
+Layout language is captured **once at hotkey press** for the session. On Linux, active layout uses `xkb-switch` / `xkblayout-state` if present, else X11 `XkbGetState` + `setxkbmap`. Built-in mappings also cover configs without that line: `us`/`gb` → `en`, `ua` → `uk`, XKB country ids that are a different Whisper language (`br` → `pt`, `si` → `sl`; `be`, `ca` are detected) and the macOS US, ABC, British, Russian and Ukrainian layouts. Your `layout_to_language` entries override them. Other layouts are used only when the layout id is a language Whisper knows (e.g. `ru`, `de`); otherwise the language is detected. Allowlist detection still runs Whisper’s normal language scores and **filters** them — not a second full decode; one language in config/allowlist skips detect entirely.
 
 **Custom terms** — `custom_terms = Claude, Kubernetes, GraphQL` (comma or newlines; hint to the decoder, not a guarantee).
 
@@ -142,7 +142,7 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 | **Streaming** | `--streaming` / `default_streaming = true` | Press hotkey to start, press again to stop. Silence (VAD) splits speech into chunks; each chunk is transcribed and inserted as you go — this is the speak+type flow. |
 | **Non-streaming (push-to-talk)** | `--no-streaming` / `default_streaming = false` | Hold hotkey to record, release to transcribe the whole buffer once, then clipboard + type. Better for short precise utterances; held keys can misbehave in some terminals/apps. |
 
-Streaming uses recent text for better recognition. Under `[streaming]`, `context_words` controls its size (default `50`; `0` disables) and `context_reset_seconds` sets the silence reset interval (default `5.0`).
+Streaming uses recent text for better recognition. Under `[streaming]`, `context_words` controls its size (default `50`; `0` disables) and `context_reset_seconds` sets the silence reset interval (default `10.0`, so a breath or a short thinking pause keeps the context).
 
 Default hotkey is **F12** (configurable). Ctrl+C quits a foreground process.
 
