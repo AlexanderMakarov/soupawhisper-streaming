@@ -153,6 +153,8 @@ Type=simple
 WorkingDirectory=$SCRIPT_DIR
 ExecStart=$venv_path/bin/python $SCRIPT_DIR/dictate.py
 Restart=on-failure
+# 78 = invalid config or a model that failed to load; restarting can't fix those.
+RestartPreventExitStatus=78
 RestartSec=5
 
 # X11 display access

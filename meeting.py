@@ -565,12 +565,19 @@ def _language_evidence(model, chunk: np.ndarray, allowlist: list[str] | None):
     return detected, confident
 
 
+def is_english_only_model(model) -> bool:
+    """True for Whisper models such as base.en, which can't decode other languages."""
+    return getattr(getattr(model, "model", None), "is_multilingual", True) is False
+
+
 def _detect_window_language(
     model,
     chunk: np.ndarray,
     allowlist: list[str] | None,
     context: np.ndarray | None = None,
 ):
+    if is_english_only_model(model):
+        return "en"
     language, confident = _language_evidence(model, chunk, allowlist)
     if confident or context is None or len(context) <= len(chunk):
         return language
@@ -648,6 +655,9 @@ def _session_log_handler(session_dir: Path) -> logging.Handler:
     )
     handler.setLevel(logging.DEBUG)
     return handler
+
+
+PROGRESS_LOADING_MODEL = "loading model"
 
 
 def _publish_progress(dictation, track: str | None, done: int, total: int) -> None:

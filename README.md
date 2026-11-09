@@ -54,7 +54,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-`install.sh` installs system libraries (Linux), Python deps, copies `config.example.ini` → `~/.config/soupawhisper/config.ini`, and can enable a user service (**systemd** on Linux, **launchd** LaunchAgent on macOS).
+[install.sh](/install.sh) installs system libraries (Linux), Python deps, copies [config.example.ini](/config.example.ini) → `~/.config/soupawhisper/config.ini`, and can enable a user service (**systemd** on Linux, **launchd** LaunchAgent on macOS).
 
 **Linux packages** (if you skip the installer or need to reinstall):
 
@@ -135,6 +135,20 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 
 **Audio device** — `--verbose` lists devices; set `audio_input_device` under `[streaming]` to an index or partial name.
 
+### Switching models from the tray
+
+To switch the dictation and meeting models from the tray while the app runs, add these settings under `[behavior]` and restart it:
+
+```ini
+models = English fast:whisper:base.en, Multi-language:whisper:small
+dictation_model = English fast
+meeting_model = Multi-language
+```
+
+[config.example.ini](/config.example.ini) explains the format and rules in its "Model switching" comments.
+
+An invalid `models` setting or a failed model load stops the app with a notification. After fixing it, run `make service-start`. Existing systemd installs need `make service-reinstall` once, so that the service doesn't restart in a loop.
+
 ### Modes (behavior)
 
 | Mode | Flag / config | What happens |
@@ -163,7 +177,7 @@ Meeting mode and dictation are **mutually exclusive**: while a meeting records, 
 
 ### Using it
 
-Start and stop from the tray menu (**Start meeting recording**), or set `hotkey = shift+f12` under `[meeting]`. The tray icon switches to a two-people glyph for the whole call, and the menu shows how much scratch audio is on disk with a **Delete recorded audio files** action.
+Start and stop from the tray menu (**Start meeting recording**), or set `hotkey = shift+f12` under `[meeting]`. The tray icon switches to a two-people glyph for the whole call, and the **Meeting audio** submenu shows how much scratch audio is on disk, with **Delete recorded audio files** and **Open recorded audio folder** actions.
 
 Nothing is transcribed while recording — two `pw-record` processes write WAV straight to disk at near-zero CPU, so nothing competes with the video call. Transcription runs once, after you stop.
 

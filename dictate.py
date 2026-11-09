@@ -4,6 +4,7 @@ import argparse
 import configparser
 import ctypes
 import ctypes.util
+import gc
 import subprocess
 import tempfile
 import threading
@@ -30,7 +31,7 @@ import webrtcvad
 
 import meeting as meeting_mod
 
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, download_model
 try:
     from faster_whisper.tokenizer import _LANGUAGE_CODES as WHISPER_LANGUAGE_CODES
 except ImportError:  # private name; keep the app importable if a release renames it
@@ -62,6 +63,30 @@ _STREAMING_VAD_PARAMETERS = {
 }
 
 
+class ConfigError(ValueError):
+    """The config file can't be used; the app reports this and doesn't start."""
+
+
+# EX_CONFIG. install.sh's systemd unit excludes it from Restart=on-failure, so a bad
+# config or model stops the app instead of restarting it every few seconds.
+FATAL_EXIT_CODE = 78
+LAUNCHD_LABEL = "com.soupawhisper.dictate"
+FATAL_NOTIFICATION_TIMEOUT_MS = 15000
+MODEL_LOADING_MESSAGE = (
+    "Model is still loading. Wait a little and try again; see the tray menu or log for status."
+)
+SUPPORTED_MODEL_ENGINES = ("whisper",)
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    """One entry of [behavior] models: a menu label and the model it selects."""
+
+    label: str
+    engine: str
+    model: str
+
+
 @dataclass(frozen=True)
 class _StreamingChunk:
     """Audio plus speech bounds on the capture timeline, excluding trailing silence."""
@@ -90,6 +115,8 @@ def resolve_transcription_language(
       **filter** those scores to your list. Cost is one encoder forward + language head (the
       heavy work is the autoregressive decoder, which still runs once per ``transcribe``).
     """
+    if meeting_mod.is_english_only_model(model):
+        return "en"
     if language is not None:
         return language
     if not language_allowlist:
@@ -501,6 +528,60 @@ def language_from_layout(layout_id: Optional[str], layout_to_language: dict[str,
     return layout_to_language.get(layout_id)
 
 
+def parse_model_choices(raw: str) -> list[ModelChoice]:
+    """Parse [behavior] models: "<label>:<engine>:<model>, ...".
+
+    Any bad entry raises ConfigError naming it. Nothing is skipped, because a
+    silently missing model is harder to notice than an app that refuses to start.
+    """
+    choices: list[ModelChoice] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        parts = [part.strip() for part in entry.split(":", 2)]
+        if len(parts) != 3 or not all(parts):
+            raise ConfigError(
+                f"[behavior] models: entry {entry.strip()!r} must be <label>:<engine>:<model>"
+            )
+        label, engine, model = parts
+        if engine not in SUPPORTED_MODEL_ENGINES:
+            raise ConfigError(
+                f"[behavior] models: entry {entry.strip()!r} has unknown engine {engine!r}; "
+                f"supported: {', '.join(SUPPORTED_MODEL_ENGINES)}"
+            )
+        if label in seen:
+            raise ConfigError(f"[behavior] models: duplicate label {label!r}")
+        seen.add(label)
+        choices.append(ModelChoice(label, engine, model))
+    return choices
+
+
+def _read_model_selection(
+    config: configparser.ConfigParser,
+) -> tuple[list[ModelChoice], Optional[str], Optional[str]]:
+    """Return the [behavior] model list and the labels used at startup."""
+    # raw=True: "%" is legal in labels and model paths, and isn't an interpolation here.
+    raw = config.get("behavior", "models", raw=True, fallback="").strip()
+    selected = {
+        key: config.get("behavior", key, raw=True, fallback="").strip()
+        for key in ("dictation_model", "meeting_model")
+    }
+    if not raw:
+        for key, label in selected.items():
+            if label:
+                raise ConfigError(f"[behavior] {key} requires [behavior] models to be set")
+        return [], None, None
+    choices = parse_model_choices(raw)
+    labels = {choice.label for choice in choices}
+    for key, label in selected.items():
+        if not label:
+            raise ConfigError(f"[behavior] {key} is required when [behavior] models is set")
+        if label not in labels:
+            raise ConfigError(
+                f"[behavior] {key}: label {label!r} is not in [behavior] models"
+            )
+    return choices, selected["dictation_model"], selected["meeting_model"]
+
+
 def load_config():
     config = configparser.ConfigParser()
 
@@ -532,9 +613,19 @@ def load_config():
     if not math.isfinite(context_reset_seconds) or context_reset_seconds < 0:
         raise ValueError("[streaming] context_reset_seconds must be finite and non-negative")
 
+    model_choices, dictation_label, meeting_label = _read_model_selection(config)
+    startup_model = next(
+        (choice.model for choice in model_choices if choice.label == dictation_label),
+        config.get("whisper", "model", fallback="base"),
+    )
+
     return {
         # Whisper
-        "model": config.get("whisper", "model", fallback="base"),
+        "model": startup_model,
+        # Models offered in the tray. Empty means the tray has no model menus.
+        "model_choices": model_choices,
+        "dictation_model": dictation_label,
+        "meeting_model": meeting_label,
         "device": config.get("whisper", "device", fallback="cpu"),
         "compute_type": config.get("whisper", "compute_type", fallback="int8"),
         "language": language,
@@ -742,6 +833,72 @@ def keys_match(
     )
 
 
+def send_desktop_notification(title, message, icon="dialog-information", timeout=2000):
+    """Show a desktop notification, ignoring the `notifications` setting."""
+    if IS_MACOS:
+        escaped_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'display notification "{escaped_msg}" with title "{escaped_title}" subtitle "SoupaWhisper"'
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+    else:
+        subprocess.run(
+            [
+                "notify-send",
+                "-a", "SoupaWhisper",
+                "-i", icon,
+                "-t", str(timeout),
+                "-h", "string:x-canonical-private-synchronous:soupawhisper",
+                title,
+                message
+            ],
+            capture_output=True
+        )
+
+
+def release_freed_memory() -> None:
+    """Hand a dropped model's memory back to the OS.
+
+    Measured with `small` (int8): after dropping the model RSS stayed near 590 MB,
+    because glibc keeps the freed pages. malloc_trim brought it back to 87 MB.
+    """
+    gc.collect()
+    if IS_MACOS:
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError) as e:
+        logger.debug("malloc_trim is unavailable: %s", e)
+
+
+def _terminate_process(code: int) -> None:
+    logging.shutdown()
+    # sys.exit() would only end the calling worker thread, not the tray's main loop.
+    os._exit(code)
+
+
+def report_fatal_error(title: str, message: str) -> None:
+    """Log an error that ends the app and tell the user, if a desktop is reachable."""
+    logger.critical("%s: %s", title, message)
+    try:
+        send_desktop_notification(
+            title, message, icon="dialog-error", timeout=FATAL_NOTIFICATION_TIMEOUT_MS
+        )
+    except Exception as e:
+        logger.error("Could not show the error notification: %s", e)
+
+
+def _prevent_launchd_restart() -> None:
+    """Unload the LaunchAgent, whose KeepAlive would otherwise restart a fatal exit."""
+    if not IS_MACOS or os.environ.get("XPC_SERVICE_NAME") != LAUNCHD_LABEL:
+        return
+    try:
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True
+        )
+    except OSError as e:
+        logger.error("Could not unload the LaunchAgent: %s", e)
+
+
 class Typer:
     """Types and removes characters in any input field via xdotool (Linux) or Quartz (macOS)."""
 
@@ -830,6 +987,16 @@ class Dictation:
         self.meeting_transcribing = False
         self.meeting_progress: Optional[str] = None
         self.model = None
+        self.model_choices: list[ModelChoice] = list(config.get("model_choices") or [])
+        self.dictation_label: Optional[str] = config.get("dictation_model")
+        self.meeting_label: Optional[str] = config.get("meeting_model")
+        self.meeting_download_label: Optional[str] = None
+        self._model_switch_in_progress = False
+        self._model_download_thread: Optional[threading.Thread] = None
+        # Makes "may this start?" and "mark it started" one step, for both a dictation
+        # start and a model switch, so neither can slip in between the other's two.
+        self._model_state_lock = threading.Lock()
+        self._exiting_fatally = False
         self.model_loaded = threading.Event()
         self.model_error = None
         self._tray_error = None
@@ -893,11 +1060,18 @@ class Dictation:
             return self.config.get("key", DEFAULT_HOTKEY)
         return getattr(self.hotkey, 'name', None) or getattr(self.hotkey, 'char', DEFAULT_HOTKEY)
 
+    def _choice_model_id(self, label: Optional[str]) -> Optional[str]:
+        return next((c.model for c in self.model_choices if c.label == label), None)
+
     def _load_model(self):
+        model_id = self._choice_model_id(self.dictation_label) or self.config["model"]
         try:
-            self.model = WhisperModel(self.config["model"], device=self.config["device"], compute_type=self.config["compute_type"])
+            if self._model_switch_in_progress:
+                release_freed_memory()
+            self.model = WhisperModel(model_id, device=self.config["device"], compute_type=self.config["compute_type"])
+            self._model_switch_in_progress = False
             self.model_loaded.set()
-            logger.info(f"Model {self.config['model']} ({self.config['device']}, {self.config['compute_type']}) loaded.")
+            logger.info(f"Model {model_id} ({self.config['device']}, {self.config['compute_type']}) loaded.")
             self._finish_model_loading()
         except Exception as e:
             self.model_error = str(e)
@@ -905,6 +1079,87 @@ class Dictation:
             logger.error(f"Failed to load model: {e}", exc_info=True)
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 logger.info("Hint: Try setting device = cpu in your config, or install cuDNN.")
+            if self._interactive:
+                self._exit_fatally(
+                    "Model failed to load",
+                    f"Could not load model {self.dictation_label or model_id!r}: {e}",
+                )
+
+    def _exit_fatally(self, title: str, message: str) -> None:
+        """Report the error and end the process, from whichever thread found it."""
+        report_fatal_error(title, message)
+        # Set before stop(), which releases the main thread: see the end of run().
+        self._exiting_fatally = True
+        try:
+            if self.meeting_active:
+                self.stop_meeting(transcribe=False)
+            self.stop()
+        except Exception as e:
+            logger.error("Error while shutting down: %s", e, exc_info=True)
+        _prevent_launchd_restart()
+        _terminate_process(FATAL_EXIT_CODE)
+
+    def can_switch_model(self) -> bool:
+        """Models change only between active phases, and one change at a time."""
+        # stop_recording() gives up waiting for the streaming worker after a timeout,
+        # so only the thread itself shows that queued chunks are finished.
+        worker = getattr(self, "transcription_thread", None)
+        busy = (
+            self.recording or getattr(self, "stopping", False) or self.transcribing
+            or self.meeting_active or self.meeting_transcribing
+            or self.meeting_download_label is not None
+            or (worker is not None and worker.is_alive())
+        )
+        return self.model_loaded.is_set() and not busy
+
+    def select_dictation_model(self, label: str) -> None:
+        if label == self.dictation_label:
+            return
+        with self._model_state_lock:
+            if not self.can_switch_model():
+                logger.warning("[model] Not switching to %r: the app is busy", label)
+                return
+            self._model_switch_in_progress = True
+            self.model_loaded.clear()
+            self.dictation_label = label
+            self.model = None
+        logger.info("[model] Switching dictation model to %r", label)
+        threading.Thread(target=self._load_model, daemon=True).start()
+
+    def select_meeting_model(self, label: str) -> None:
+        """Choose the next meeting's model. It's fetched now but loaded only to transcribe."""
+        if label == self.meeting_label:
+            return
+        with self._model_state_lock:
+            if not self.can_switch_model():
+                logger.warning("[model] Not switching meeting model to %r: the app is busy", label)
+                return
+            self.meeting_label = label
+            self.meeting_download_label = label
+        logger.info("[model] Meeting model set to %r; downloading if needed", label)
+        self._model_download_thread = threading.Thread(
+            target=self._download_meeting_model, args=(label,), daemon=True
+        )
+        self._model_download_thread.start()
+
+    def _download_meeting_model(self, label: str) -> None:
+        model_id = self._choice_model_id(label)
+        try:
+            if not os.path.isdir(model_id):
+                download_model(model_id)
+        except Exception as e:
+            logger.error("[model] Download of %s failed", model_id, exc_info=True)
+            self._exit_fatally("Model download failed", f"Could not download model {label!r}: {e}")
+            return
+        self.meeting_download_label = None
+        logger.info("[model] Meeting model %r is ready", label)
+
+    def _reject_start_while_loading(self) -> bool:
+        """Refuse a start at once: waiting would begin recording long after the press."""
+        if self.model_loaded.is_set():
+            return False
+        self.notify("Model loading", MODEL_LOADING_MESSAGE, logging.WARNING, 5000)
+        return True
 
     def _finish_model_loading(self):
         if not self._interactive:
@@ -1069,24 +1324,7 @@ class Dictation:
         log_method("Showing notification: %s, %s, %s, %s", title, message, icon, timeout)
         if not self.config["notifications"]:
             return
-        if IS_MACOS:
-            escaped_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-            escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
-            script = f'display notification "{escaped_msg}" with title "{escaped_title}" subtitle "SoupaWhisper"'
-            subprocess.run(["osascript", "-e", script], capture_output=True)
-        else:
-            subprocess.run(
-                [
-                    "notify-send",
-                    "-a", "SoupaWhisper",
-                    "-i", icon,
-                    "-t", str(timeout),
-                    "-h", "string:x-canonical-private-synchronous:soupawhisper",
-                    title,
-                    message
-                ],
-                capture_output=True
-            )
+        send_desktop_notification(title, message, icon=icon, timeout=timeout)
 
     def _segments_to_text(self, segments: Iterable[Segment], auto_sentence: bool) -> str:
         """Format text as a sentence: capitalize first letter and add period at end if needed."""
@@ -1215,17 +1453,7 @@ class Dictation:
         # Convert int16 to float32 and normalize to [-1.0, 1.0]
         if audio_array.dtype == np.int16:
             audio_array = audio_array.astype(np.float32) / 32768.0
-        enforced = self._maybe_enforced_language_for_field()
-        configured_lang = self.config.get("language")
-        allowlist = self.config.get("language_allowlist")
-        if enforced and configured_lang is None:
-            # Only override in auto mode. If allowlist exists, enforce only if it is allowed.
-            if not allowlist or enforced in allowlist:
-                lang = enforced
-            else:
-                lang = resolve_transcription_language(self.model, audio_array, configured_lang, allowlist)
-        else:
-            lang = resolve_transcription_language(self.model, audio_array, configured_lang, allowlist)
+        lang = self._language_for_audio(audio_array)
         segments, info = self.model.transcribe(
             audio_array,
             vad_filter=True,
@@ -1258,6 +1486,20 @@ class Dictation:
             return False
         return normalized in self._reject_phrase_set
 
+    def _language_for_audio(self, audio: np.ndarray) -> Optional[str]:
+        """Pick the decode language: layout override, else configured or detected."""
+        enforced = self._maybe_enforced_language_for_field()
+        configured_lang = self.config.get("language")
+        allowlist = self.config.get("language_allowlist")
+        # Only override in auto mode. If allowlist exists, enforce only if it is allowed.
+        if (
+            enforced and configured_lang is None
+            and (not allowlist or enforced in allowlist)
+            and not meeting_mod.is_english_only_model(self.model)
+        ):
+            return enforced
+        return resolve_transcription_language(self.model, audio, configured_lang, allowlist)
+
     def meeting_model(self):
         """Whisper model used for meeting transcription, built on first use.
 
@@ -1267,9 +1509,12 @@ class Dictation:
         """
         if self._meeting_model is None:
             threads = self.config["meeting_cpu_threads"]
-            logger.info("[meeting] Loading model %s (%d threads)", self.config["model"], threads)
+            model_id = self._choice_model_id(self.meeting_label) or self.config["model"]
+            logger.info("[meeting] Loading model %s (%d threads)", model_id, threads)
+            # May include a first-time download, so say why progress hasn't started.
+            self.meeting_progress = meeting_mod.PROGRESS_LOADING_MODEL
             self._meeting_model = WhisperModel(
-                self.config["model"],
+                model_id,
                 device=self.config["device"],
                 compute_type=self.config["compute_type"],
                 cpu_threads=threads,
@@ -1285,21 +1530,30 @@ class Dictation:
         if self.meeting_active:
             logger.info("[meeting] Already recording")
             return
-        self.meeting = meeting_mod.MeetingRecorder(
-            transcript_dir=Path(self.config["meeting_transcript_dir"]),
-            tmp_root=self._meeting_tmp_root,
-            max_duration_s=self.config["meeting_max_duration_min"] * 60,
-            silence_stop_s=self.config["meeting_silence_stop_min"] * 60,
-            spawn=self._meeting_spawn,
-        )
-        try:
-            self.meeting.start()
-        except OSError as e:
-            self.meeting = None
-            self._tray_error = f"Meeting recording failed: {e}"
-            self.notify("Meeting", f"Could not start recording: {e}", logging.ERROR, 5000)
+        start_error = None
+        with self._model_state_lock:
+            refused = self._model_switch_in_progress or self.meeting_download_label is not None
+            if not refused:
+                self.meeting = meeting_mod.MeetingRecorder(
+                    transcript_dir=Path(self.config["meeting_transcript_dir"]),
+                    tmp_root=self._meeting_tmp_root,
+                    max_duration_s=self.config["meeting_max_duration_min"] * 60,
+                    silence_stop_s=self.config["meeting_silence_stop_min"] * 60,
+                    spawn=self._meeting_spawn,
+                )
+                try:
+                    self.meeting.start()
+                    self.meeting_active = True
+                except OSError as e:
+                    self.meeting = None
+                    start_error = e
+        if refused:
+            self.notify("Model loading", MODEL_LOADING_MESSAGE, logging.WARNING, 5000)
             return
-        self.meeting_active = True
+        if start_error is not None:
+            self._tray_error = f"Meeting recording failed: {start_error}"
+            self.notify("Meeting", f"Could not start recording: {start_error}", logging.ERROR, 5000)
+            return
         logger.info("[meeting] Recording to %s", self.meeting.session_dir)
         self.notify("Meeting", "Recording started (dictation paused)", logging.INFO, 2500)
         self._meeting_stop_event.clear()
@@ -1375,7 +1629,10 @@ class Dictation:
                 8000,
             )
         finally:
-            self.transcribing = False
+            # Only ever in memory while a meeting is being transcribed.
+            self._meeting_model = None
+            release_freed_memory()
+            self.meeting_transcribing = False
 
     def _handle_modifier(self, key, pressed: bool) -> bool:
         """Track held modifiers. Returns True if the key was a modifier."""
@@ -1602,8 +1859,12 @@ class Dictation:
                 name="hotkey_supervisor",
             ).start()
             tray.run_blocking()
-            return
-        self._run_supervisor_loop()
+        else:
+            self._run_supervisor_loop()
+        if self._exiting_fatally:
+            # Returning would start interpreter shutdown, which freezes the daemon thread
+            # that is about to call os._exit(), and the process would end with code 0.
+            threading.Event().wait()
 
     def _audio_recording_worker(self):
         """Audio recording worker thread that collects audio data into one array."""
@@ -1623,15 +1884,17 @@ class Dictation:
     def start_recording(self):
         if self.recording:
             return
-        self.model_loaded.wait()
-        if self.model_error or self.model is None:
-            logger.error("Recording is not ready yet.")
-            return
+        with self._model_state_lock:
+            if self._reject_start_while_loading():
+                return
+            if self.model_error or self.model is None:
+                logger.error("Recording is not ready yet.")
+                return
 
-        # Capture enforced language once for this session (hotkey press).
-        self._begin_session_language()
+            # Capture enforced language once for this session (hotkey press).
+            self._begin_session_language()
 
-        self.recording = True
+            self.recording = True
         self.audio_data = []
         self._audio_problem_notified = False
 
@@ -1653,8 +1916,9 @@ class Dictation:
         if not self.recording:
             return
 
-        self.recording = False
+        # Next phase first, so a model switch never sees neither flag set.
         self.transcribing = True
+        self.recording = False
 
         if self.audio_thread:
             self.audio_thread.join(timeout=2.0)
@@ -1901,14 +2165,16 @@ class StreamingDictation(Dictation):
         if self.stopping:
             self.notify("Error", "Previous recording is still shutting down. Please wait a moment.", logging.ERROR, 3000)
             return
-        self.model_loaded.wait()
-        if self.model_error or self.model is None:
-            self.notify("Error", "Model is not loaded yet", logging.ERROR, 3000)
-            return
-        # Capture enforced language once for this streaming session (hotkey press).
-        self._begin_session_language()
-        # Reset transcription state.
-        self.recording = True
+        with self._model_state_lock:
+            if self._reject_start_while_loading():
+                return
+            if self.model_error or self.model is None:
+                self.notify("Error", "Model is not loaded yet", logging.ERROR, 3000)
+                return
+            # Capture enforced language once for this streaming session (hotkey press).
+            self._begin_session_language()
+            # Reset transcription state.
+            self.recording = True
         self._audio_problem_notified = False
         self.accumulated_text = ""
         self.in_speech = False
@@ -2106,16 +2372,7 @@ class StreamingDictation(Dictation):
                     segment = segment.astype(np.float32) / 32768.0
                 # Note: transcribe() returns an iterator; iteration runs the decoder.
                 trans_start = time.monotonic()
-                enforced = self._maybe_enforced_language_for_field()
-                configured_lang = self.config.get("language")
-                allowlist = self.config.get("language_allowlist")
-                if enforced and configured_lang is None:
-                    if not allowlist or enforced in allowlist:
-                        lang = enforced
-                    else:
-                        lang = resolve_transcription_language(self.model, segment, configured_lang, allowlist)
-                else:
-                    lang = resolve_transcription_language(self.model, segment, configured_lang, allowlist)
+                lang = self._language_for_audio(segment)
                 # With unrestricted auto detection, resolve the new chunk's language
                 # before supplying history so a switch cannot inherit the old prompt.
                 if recent_text and lang is None:
@@ -2231,8 +2488,9 @@ class StreamingDictation(Dictation):
     def stop_recording(self):
         if not self.recording:
             return
-        self.recording = False
+        # Next phase first, so a model switch never sees neither flag set.
         self.stopping = True
+        self.recording = False
         # Notify about stopping.
         self.notify("Transcribing stopped", "Processing remaining chunks", logging.INFO, 1500, "emblem-synchronizing")
         if self.audio_thread:
@@ -2385,7 +2643,12 @@ def main():
     )
 
     # Load and print configuration
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        report_fatal_error("Invalid configuration", f"{e} (file: {CONFIG_PATH})")
+        _prevent_launchd_restart()
+        sys.exit(FATAL_EXIT_CODE)
     logger.info("Configuration:")
     for key, value in config.items():
         logger.info(f"  {key}: {value}")
