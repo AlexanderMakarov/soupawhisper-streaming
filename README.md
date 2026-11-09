@@ -137,22 +137,9 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 
 ### Switching models from the tray
 
-Set `models` under `[behavior]` to pick the dictation model and the meeting model from the tray, with no restart:
+Set `models` under `[behavior]` to choose the dictation and meeting models from the tray, with no restart. The format and rules are in [Model switching](config.example.ini#L84) in the default config.
 
-```ini
-[behavior]
-models = English fast:whisper:base.en, Multi-language:whisper:small
-dictation_model = English fast
-meeting_model = Multi-language
-```
-
-Each entry is `<label>:<engine>:<model>`, and `dictation_model` / `meeting_model` are labels from that list, used at startup. With `models` set, `[whisper] model` is ignored.
-
-- **When:** only between active phases. The menus are disabled while recording, transcribing, or during a meeting. While a dictation model loads, dictation can't start: the hotkey is refused with a notification, and the menu shows the progress.
-- **Memory:** one dictation model at a time. The meeting model is loaded only to transcribe a meeting and released afterwards, so both are in memory only during that transcription.
-- **Downloads:** startup fetches only the active dictation model. Picking a model in the tray downloads it. A `meeting_model` you never picked in the tray is downloaded when its first meeting is transcribed.
-- **Language:** English-only models (`.en`) always use English. For multilingual models, set `language = auto`, because `language = en` keeps them in English.
-- **Errors stop the app.** An invalid `models` setting, a model that fails to load, or a failed download from the tray ends the app with a notification and exit code 78, which the systemd unit doesn't restart. On macOS the app unloads its LaunchAgent so that launchd doesn't restart it. After fixing the problem, run `make service-start`. If you installed the systemd service before this change, run `make service-reinstall` to get that behaviour. Meeting transcription failures keep the audio and don't stop the app.
+An invalid `models` setting or a failed model load stops the app with a notification. After fixing it, run `make service-start`. Existing systemd installs need `make service-reinstall` once, so that the service doesn't restart in a loop.
 
 ### Modes (behavior)
 
