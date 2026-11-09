@@ -137,7 +137,15 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 
 ### Switching models from the tray
 
-Set `models` under `[behavior]` to choose the dictation and meeting models from the tray, with no restart. The format and rules are in [Model switching](config.example.ini#L84) in the default config.
+To choose the dictation and meeting models from the tray, with no restart, add these settings under `[behavior]`:
+
+```ini
+models = English fast:whisper:base.en, Multi-language:whisper:small
+dictation_model = English fast
+meeting_model = Multi-language
+```
+
+`config.example.ini` explains the format and rules in its "Model switching" comments.
 
 An invalid `models` setting or a failed model load stops the app with a notification. After fixing it, run `make service-start`. Existing systemd installs need `make service-reinstall` once, so that the service doesn't restart in a loop.
 
