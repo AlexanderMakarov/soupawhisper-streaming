@@ -54,7 +54,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-`install.sh` installs system libraries (Linux), Python deps, copies `config.example.ini` → `~/.config/soupawhisper/config.ini`, and can enable a user service (**systemd** on Linux, **launchd** LaunchAgent on macOS).
+[install.sh](/install.sh) installs system libraries (Linux), Python deps, copies [config.example.ini](/config.example.ini) → `~/.config/soupawhisper/config.ini`, and can enable a user service (**systemd** on Linux, **launchd** LaunchAgent on macOS).
 
 **Linux packages** (if you skip the installer or need to reinstall):
 
@@ -145,7 +145,7 @@ dictation_model = English fast
 meeting_model = Multi-language
 ```
 
-`config.example.ini` explains the format and rules in its "Model switching" comments.
+[config.example.ini](/config.example.ini) explains the format and rules in its "Model switching" comments.
 
 An invalid `models` setting or a failed model load stops the app with a notification. After fixing it, run `make service-start`. Existing systemd installs need `make service-reinstall` once, so that the service doesn't restart in a loop.
 
