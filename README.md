@@ -137,7 +137,7 @@ Layout language is captured **once at hotkey press** for the session. On Linux, 
 
 ### Switching models from the tray
 
-To choose the dictation and meeting models from the tray, with no restart, add these settings under `[behavior]`:
+To switch the dictation and meeting models from the tray while the app runs, add these settings under `[behavior]` and restart it:
 
 ```ini
 models = English fast:whisper:base.en, Multi-language:whisper:small
