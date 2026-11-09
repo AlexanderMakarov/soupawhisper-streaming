@@ -9,6 +9,7 @@ import numpy as np
 import queue
 from unittest.mock import MagicMock, patch
 from typing import Any
+from pathlib import Path
 from types import SimpleNamespace
 import threading
 
@@ -84,6 +85,19 @@ class MockWhisperModel:
                 no_speech_prob=0.0, words=None, temperature=None
             )
             return [segment], SimpleNamespace(duration=1.0)
+
+
+# A model-load thread can outlive the test that started it, so these guards hold for
+# the whole run: a per-test patch would be gone by the time such a thread fails.
+_real_terminate_process = dictate._terminate_process
+dictate._terminate_process = lambda code: None
+dictate.send_desktop_notification = lambda *a, **k: None
+
+
+@pytest.fixture(autouse=True)
+def no_real_model_loads(monkeypatch):
+    """Tests needing a specific model use mock_whisper_model or created_models."""
+    monkeypatch.setattr(dictate.WhisperModel, "__new__", lambda cls, *a, **k: MagicMock())
 
 
 @pytest.fixture
@@ -2355,3 +2369,1057 @@ class TestStreamingContextConfiguration:
         d = dictate.StreamingDictation(config)
         assert d.context_words == 12
         assert d.context_reset_seconds == 2.5
+
+
+# --- Model switching (#25) ---------------------------------------------------
+
+MODELS_VALUE = "English fast:whisper:base.en, Multi-language:whisper:small"
+
+
+def _write_behavior(config_file, **behavior):
+    extra = "".join(f"{key} = {value}\n" for key, value in behavior.items())
+    config_file.write_text(config_file.read_text().replace("[behavior]\n", "[behavior]\n" + extra))
+
+
+def _models_config(config_file, dictation_model="English fast", meeting_model="Multi-language"):
+    _write_behavior(
+        config_file,
+        models=MODELS_VALUE,
+        dictation_model=dictation_model,
+        meeting_model=meeting_model,
+    )
+    return dictate.load_config()
+
+
+@pytest.fixture
+def created_models(monkeypatch):
+    """Replace WhisperModel; each build is recorded as (name, kwargs, model)."""
+    created = []
+
+    def factory(name, **kwargs):
+        model = MagicMock(name=name)
+        model.model_id = name
+        created.append((name, kwargs, model))
+        return model
+
+    monkeypatch.setattr(dictate, "WhisperModel", factory)
+    return created
+
+
+@pytest.fixture
+def fatal_exit(monkeypatch):
+    """Stand in for the process exit and the desktop notification."""
+    state = SimpleNamespace(event=threading.Event(), codes=[], toasts=[])
+
+    def fake_exit(code):
+        state.codes.append(code)
+        state.event.set()
+
+    monkeypatch.setattr(dictate, "_terminate_process", fake_exit)
+    monkeypatch.setattr(
+        dictate, "send_desktop_notification",
+        lambda title, message, **kwargs: state.toasts.append((title, message)),
+    )
+    return state
+
+
+def _loaded(dictation):
+    assert dictation.model_loaded.wait(2)
+    return dictation
+
+
+class TestModelChoicesConfig:
+    def test_parses_labels_engines_and_models(self, mock_config):
+        config = _models_config(mock_config)
+
+        assert config["model_choices"] == [
+            dictate.ModelChoice("English fast", "whisper", "base.en"),
+            dictate.ModelChoice("Multi-language", "whisper", "small"),
+        ]
+
+    def test_label_case_is_preserved(self):
+        assert dictate.parse_model_choices("MiXeD Case:whisper:tiny")[0].label == "MiXeD Case"
+
+    def test_model_value_may_contain_colons(self):
+        choice = dictate.parse_model_choices("Local:whisper:C:/models/tiny")[0]
+
+        assert choice.model == "C:/models/tiny"
+
+    def test_startup_labels_are_read(self, mock_config):
+        config = _models_config(mock_config)
+
+        assert config["dictation_model"] == "English fast"
+        assert config["meeting_model"] == "Multi-language"
+
+    def test_startup_model_replaces_whisper_model(self, mock_config):
+        config = _models_config(mock_config, dictation_model="Multi-language")
+
+        assert config["model"] == "small"
+
+    def test_unset_leaves_behaviour_unchanged(self, mock_config):
+        config = dictate.load_config()
+
+        assert config["model_choices"] == []
+        assert config["model"] == "base.en"
+
+    @pytest.mark.parametrize("raw", [
+        "no-colons",
+        "Only:whisper",
+        ":whisper:tiny",
+        "Label:whisper:",
+        "Label::tiny",
+        "A:whisper:tiny,,B:whisper:small",
+        "A:whisper:tiny, A:whisper:small",
+        "A:parakeet:tiny",
+    ])
+    def test_invalid_list_is_rejected(self, raw):
+        with pytest.raises(dictate.ConfigError):
+            dictate.parse_model_choices(raw)
+
+    def test_error_names_the_bad_entry(self):
+        with pytest.raises(dictate.ConfigError, match="no-colons"):
+            dictate.parse_model_choices("no-colons")
+
+    @pytest.mark.parametrize("behavior", [
+        {"models": MODELS_VALUE, "meeting_model": "Multi-language"},
+        {"models": MODELS_VALUE, "dictation_model": "English fast"},
+        {"models": MODELS_VALUE, "dictation_model": "Nope", "meeting_model": "Multi-language"},
+        {"models": MODELS_VALUE, "dictation_model": "English fast", "meeting_model": "Nope"},
+        {"dictation_model": "English fast"},
+        {"meeting_model": "Multi-language"},
+    ])
+    def test_invalid_selection_is_rejected(self, mock_config, behavior):
+        _write_behavior(mock_config, **behavior)
+
+        with pytest.raises(dictate.ConfigError):
+            dictate.load_config()
+
+    def test_main_reports_invalid_config_and_exits(self, monkeypatch, fatal_exit):
+        def bad_config():
+            raise dictate.ConfigError("bad entry 'x'")
+
+        monkeypatch.setattr(dictate, "load_config", bad_config)
+        monkeypatch.setattr(sys, "argv", ["dictate.py"])
+
+        with pytest.raises(SystemExit) as exc:
+            dictate.main()
+
+        assert exc.value.code == dictate.FATAL_EXIT_CODE
+        assert "bad entry 'x'" in fatal_exit.toasts[0][1]
+
+    def test_service_does_not_restart_on_fatal_exit(self):
+        install = (Path(dictate.__file__).parent / "install.sh").read_text()
+
+        assert f"RestartPreventExitStatus={dictate.FATAL_EXIT_CODE}" in install
+
+
+class TestStartRejectedWhileLoading:
+    @pytest.fixture(params=["Dictation", "StreamingDictation"])
+    def dictation(self, request, mock_config, created_models):
+        return _loaded(getattr(dictate, request.param)(dictate.load_config()))
+
+    def _start_returns(self, dictation):
+        thread = threading.Thread(target=dictation.start_recording, daemon=True)
+        thread.start()
+        thread.join(1)
+        return not thread.is_alive()
+
+    def test_start_does_not_wait_for_the_load(self, dictation):
+        dictation.model_loaded.clear()
+
+        assert self._start_returns(dictation)
+        assert dictation.recording is False
+
+    def test_notification_tells_user_to_wait_and_where_to_look(self, dictation, fatal_exit):
+        dictation.config["notifications"] = True
+        dictation.model_loaded.clear()
+
+        dictation.start_recording()
+
+        message = fatal_exit.toasts[0][1]
+        assert "Wait a little" in message
+        assert "tray menu" in message
+        assert "log" in message
+
+    def test_rejection_is_logged_with_the_same_advice(self, dictation, fatal_exit, caplog):
+        dictation.model_loaded.clear()
+
+        with caplog.at_level(logging.WARNING):
+            dictation.start_recording()
+
+        assert dictate.MODEL_LOADING_MESSAGE in caplog.text
+
+
+class TestDictationModelSwitch:
+    def _dictation(self, mock_config):
+        return _loaded(dictate.Dictation(_models_config(mock_config)))
+
+    def test_startup_uses_configured_label(self, mock_config, created_models):
+        d = self._dictation(mock_config)
+
+        assert d.dictation_label == "English fast"
+        assert created_models[0][0] == "base.en"
+
+    def test_selecting_a_label_swaps_the_model(self, mock_config, created_models):
+        d = self._dictation(mock_config)
+
+        d.select_dictation_model("Multi-language")
+
+        _loaded(d)
+        assert d.dictation_label == "Multi-language"
+        assert d.model.model_id == "small"
+
+    def test_old_model_is_released_before_the_new_one_loads(self, mock_config, monkeypatch):
+        models_seen = []
+        holder = {}
+
+        def factory(name, **kwargs):
+            if "dictation" in holder:
+                models_seen.append(holder["dictation"].model)
+            return MagicMock()
+
+        monkeypatch.setattr(dictate, "WhisperModel", factory)
+        holder["dictation"] = d = self._dictation(mock_config)
+
+        d.select_dictation_model("Multi-language")
+
+        _loaded(d)
+        assert models_seen == [None]
+
+    def test_loading_state_is_set_until_load_finishes(self, mock_config, monkeypatch):
+        release = threading.Event()
+        calls = []
+
+        def factory(name, **kwargs):
+            calls.append(name)
+            if len(calls) > 1:
+                release.wait(2)
+            return MagicMock()
+
+        monkeypatch.setattr(dictate, "WhisperModel", factory)
+        d = self._dictation(mock_config)
+
+        d.select_dictation_model("Multi-language")
+
+        assert d.model_loaded.is_set() is False
+        release.set()
+        _loaded(d)
+
+    def test_selecting_active_label_does_not_reload(self, mock_config, created_models):
+        d = self._dictation(mock_config)
+
+        d.select_dictation_model("English fast")
+
+        assert d.model_loaded.is_set()
+        assert len(created_models) == 1
+
+    @pytest.mark.parametrize("attr", [
+        "recording", "stopping", "transcribing", "meeting_active", "meeting_transcribing",
+    ])
+    def test_switch_is_refused_during_active_phases(self, mock_config, created_models, attr):
+        d = self._dictation(mock_config)
+        setattr(d, attr, True)
+
+        assert d.can_switch_model() is False
+        d.select_dictation_model("Multi-language")
+
+        assert d.dictation_label == "English fast"
+        assert len(created_models) == 1
+
+    def test_switch_is_refused_while_a_model_is_loading(self, mock_config, created_models):
+        d = self._dictation(mock_config)
+        d.model_loaded.clear()
+
+        assert d.can_switch_model() is False
+
+    def test_switch_is_allowed_when_idle(self, mock_config, created_models):
+        d = self._dictation(mock_config)
+
+        assert d.can_switch_model() is True
+
+    def test_meeting_cannot_start_during_a_switch(self, mock_config, created_models, monkeypatch):
+        d = self._dictation(mock_config)
+        d.model_loaded.clear()
+        d._model_switch_in_progress = True
+        recorder = MagicMock()
+        monkeypatch.setattr(dictate.meeting_mod, "MeetingRecorder", recorder)
+
+        d.start_meeting()
+
+        recorder.assert_not_called()
+        assert d.meeting_active is False
+
+
+class TestFatalModelFailure:
+    def _failing_factory(self, monkeypatch, fail_on):
+        def factory(name, **kwargs):
+            if name == fail_on:
+                raise RuntimeError(f"cannot load {name}")
+            return MagicMock()
+
+        monkeypatch.setattr(dictate, "WhisperModel", factory)
+
+    def test_failed_startup_load_stops_the_app(self, mock_config, monkeypatch, fatal_exit):
+        self._failing_factory(monkeypatch, "base.en")
+
+        dictate.Dictation(dictate.load_config())
+
+        assert fatal_exit.event.wait(2)
+        assert fatal_exit.codes == [dictate.FATAL_EXIT_CODE]
+        assert "cannot load base.en" in fatal_exit.toasts[0][1]
+
+    def test_failed_switch_stops_the_app(self, mock_config, monkeypatch, fatal_exit):
+        self._failing_factory(monkeypatch, "small")
+        d = _loaded(dictate.Dictation(_models_config(mock_config)))
+
+        d.select_dictation_model("Multi-language")
+
+        assert fatal_exit.event.wait(2)
+        assert fatal_exit.codes == [dictate.FATAL_EXIT_CODE]
+        assert "Multi-language" in fatal_exit.toasts[0][1]
+
+    def test_notification_ignores_notifications_setting(self, mock_config, monkeypatch, fatal_exit):
+        # The fixture config has notifications = false.
+        self._failing_factory(monkeypatch, "base.en")
+
+        d = dictate.Dictation(dictate.load_config())
+
+        assert fatal_exit.event.wait(2)
+        assert d.config["notifications"] is False
+        assert fatal_exit.toasts
+
+    def test_failure_runs_normal_shutdown(self, mock_config, monkeypatch, fatal_exit):
+        self._failing_factory(monkeypatch, "base.en")
+
+        d = dictate.Dictation(dictate.load_config())
+
+        assert fatal_exit.event.wait(2)
+        assert d.running is False
+
+    def test_file_mode_still_reports_through_model_error(self, mock_config, monkeypatch, fatal_exit):
+        self._failing_factory(monkeypatch, "base.en")
+
+        d = dictate.Dictation(dictate.load_config(), interactive=False)
+
+        assert d.model_loaded.wait(2)
+        assert "cannot load base.en" in d.model_error
+        assert fatal_exit.codes == []
+
+
+class TestMeetingModelLifecycle:
+    def _dictation(self, mock_config):
+        return _loaded(dictate.Dictation(_models_config(mock_config)))
+
+    def test_meeting_model_is_not_loaded_at_startup(self, mock_config, created_models):
+        self._dictation(mock_config)
+
+        assert [name for name, _, _ in created_models] == ["base.en"]
+
+    def test_uses_configured_meeting_label_with_thread_cap(self, mock_config, created_models):
+        d = self._dictation(mock_config)
+
+        d.meeting_model()
+
+        name, kwargs, _ = created_models[-1]
+        assert name == "small"
+        assert kwargs["cpu_threads"] == d.config["meeting_cpu_threads"]
+
+    def test_without_models_uses_dictation_model(self, mock_config, created_models):
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+
+        d.meeting_model()
+
+        assert created_models[-1][0] == "base.en"
+
+    def test_released_after_successful_transcription(self, mock_config, created_models, monkeypatch, tmp_path):
+        d = self._dictation(mock_config)
+
+        def finish(dictation, session_dir, transcript_dir):
+            dictation.meeting_model()
+            return tmp_path / "out.md"
+
+        monkeypatch.setattr(dictate.meeting_mod, "finish_session", finish)
+
+        d._transcribe_meeting(tmp_path)
+
+        assert d._meeting_model is None
+
+    def test_released_after_failed_transcription(self, mock_config, created_models, monkeypatch, tmp_path):
+        d = self._dictation(mock_config)
+
+        def finish(dictation, session_dir, transcript_dir):
+            dictation.meeting_model()
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(dictate.meeting_mod, "finish_session", finish)
+
+        d._transcribe_meeting(tmp_path)
+
+        assert d._meeting_model is None
+
+    def test_selecting_downloads_without_loading(self, mock_config, created_models, monkeypatch):
+        downloaded = threading.Event()
+        names = []
+
+        def download(name):
+            names.append(name)
+            downloaded.set()
+
+        monkeypatch.setattr(dictate, "download_model", download)
+        d = self._dictation(mock_config)
+
+        d.select_meeting_model("English fast")
+
+        assert downloaded.wait(2)
+        assert names == ["base.en"]
+        assert d.meeting_label == "English fast"
+        assert len(created_models) == 1
+
+    def test_local_directory_is_not_downloaded(self, mock_config, created_models, monkeypatch, tmp_path):
+        download = MagicMock()
+        monkeypatch.setattr(dictate, "download_model", download)
+        d = self._dictation(mock_config)
+        d.model_choices.append(dictate.ModelChoice("Local", "whisper", str(tmp_path)))
+
+        d.select_meeting_model("Local")
+        d._model_download_thread.join(2)
+
+        download.assert_not_called()
+        assert d.meeting_label == "Local"
+
+    def test_download_in_progress_blocks_switching(self, mock_config, created_models, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr(dictate, "download_model", lambda name: release.wait(2))
+        d = self._dictation(mock_config)
+
+        d.select_meeting_model("English fast")
+
+        assert d.meeting_download_label == "English fast"
+        assert d.can_switch_model() is False
+        release.set()
+        d._model_download_thread.join(2)
+        assert d.meeting_download_label is None
+        assert d.can_switch_model() is True
+
+    def test_failed_download_stops_the_app(self, mock_config, created_models, monkeypatch, fatal_exit):
+        def download(name):
+            raise OSError("no network")
+
+        monkeypatch.setattr(dictate, "download_model", download)
+        d = self._dictation(mock_config)
+
+        d.select_meeting_model("English fast")
+
+        assert fatal_exit.event.wait(2)
+        assert fatal_exit.codes == [dictate.FATAL_EXIT_CODE]
+        assert "no network" in fatal_exit.toasts[0][1]
+
+    def test_dictation_and_meeting_choices_are_independent(self, mock_config, created_models, monkeypatch):
+        monkeypatch.setattr(dictate, "download_model", lambda name: None)
+        d = self._dictation(mock_config)
+
+        d.select_meeting_model("English fast")
+        d._model_download_thread.join(2)
+
+        assert d.dictation_label == "English fast"
+        assert d.meeting_label == "English fast"
+        d.select_dictation_model("Multi-language")
+        _loaded(d)
+        assert d.meeting_label == "English fast"
+
+
+class TestEnglishOnlyModels:
+    def _english_only(self):
+        return MagicMock(**{"model.is_multilingual": False})
+
+    def test_resolver_returns_en_without_detection(self):
+        model = self._english_only()
+
+        lang = dictate.resolve_transcription_language(model, np.zeros(10), None, ["en", "ru"])
+
+        assert lang == "en"
+        model.detect_language.assert_not_called()
+
+    def test_resolver_overrides_a_fixed_language(self):
+        assert dictate.resolve_transcription_language(self._english_only(), np.zeros(10), "ru", None) == "en"
+
+    def test_multilingual_model_keeps_configured_language(self):
+        model = MagicMock(**{"model.is_multilingual": True})
+
+        assert dictate.resolve_transcription_language(model, np.zeros(10), "ru", None) == "ru"
+
+    def test_layout_language_does_not_override_english_only(self, mock_config, created_models):
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+        d.model = self._english_only()
+        d.config["language"] = None
+        d.config["enforce_language_from_layout"] = True
+        d._session_enforced_language = "ru"
+
+        assert d._language_for_audio(np.zeros(10)) == "en"
+        d.model.detect_language.assert_not_called()
+
+    def test_meeting_runs_skip_detection(self):
+        import meeting
+
+        model = self._english_only()
+
+        assert meeting._detect_window_language(model, np.zeros(10), ["en", "ru"]) == "en"
+        model.detect_language.assert_not_called()
+
+    def test_tray_shows_en(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            _session_enforced_language="ru",
+            config={"language": None},
+            model=self._english_only(),
+        )
+
+        assert tray_status.language_label(d) == ("EN", False)
+
+
+class _FakeMenuItem:
+    def __init__(self, text, action=None, checked=None, radio=False, enabled=True):
+        self.text, self.action, self.checked = text, action, checked
+        self.radio, self.enabled = radio, enabled
+
+    def title(self):
+        return self.text(self) if callable(self.text) else self.text
+
+    def is_enabled(self):
+        return self.enabled(self) if callable(self.enabled) else self.enabled
+
+
+class _FakeMenu:
+    SEPARATOR = object()
+
+    def __init__(self, *items):
+        self.items = items
+
+
+class TestTrayModelMenus:
+    CHOICES = [
+        dictate.ModelChoice("English fast", "whisper", "base.en"),
+        dictate.ModelChoice("Multi-language", "whisper", "small"),
+    ]
+
+    def _tray(self, **kw):
+        import tray_status
+
+        base = dict(
+            model_error=None, _tray_error=None, recording=False, stopping=False,
+            transcribing=False, meeting_active=False, meeting_transcribing=False,
+            config={"model": "base.en"}, model_choices=list(self.CHOICES),
+            dictation_label="English fast", meeting_label="Multi-language",
+            meeting_download_label=None, can_switch_model=lambda: True,
+            select_dictation_model=MagicMock(), select_meeting_model=MagicMock(),
+            model_loaded=SimpleNamespace(is_set=lambda: True),
+        )
+        base.update(kw)
+        tray = tray_status.TrayStatus(SimpleNamespace(**base))
+        return tray, tray._build_menu(_FakeMenu, _FakeMenuItem).items
+
+    def _titles(self, items):
+        return [None if i is _FakeMenu.SEPARATOR else i.title() for i in items]
+
+    def _find(self, items, prefix):
+        return next(i for i in items if i is not _FakeMenu.SEPARATOR and i.title().startswith(prefix))
+
+    def test_submenu_titles_show_active_choices(self):
+        _, items = self._tray()
+
+        assert self._find(items, "Dictation model").title() == "Dictation model: English fast"
+        assert self._find(items, "Meeting model").title() == "Meeting model: Multi-language"
+
+    def test_plain_model_row_is_replaced(self):
+        _, items = self._tray()
+
+        assert not [t for t in self._titles(items) if t and t.startswith("Model:")]
+
+    def test_submenu_lists_labels_in_config_order(self):
+        _, items = self._tray()
+
+        sub = self._find(items, "Dictation model").action.items
+        assert self._titles(sub) == ["English fast", "Multi-language"]
+        assert all(i.radio for i in sub)
+
+    def test_active_choice_is_checked_in_each_menu(self):
+        _, items = self._tray()
+
+        dictation = self._find(items, "Dictation model").action.items
+        meeting = self._find(items, "Meeting model").action.items
+        assert [bool(i.checked(i)) for i in dictation] == [True, False]
+        assert [bool(i.checked(i)) for i in meeting] == [False, True]
+
+    def test_selecting_routes_label_to_the_right_menu(self):
+        tray, items = self._tray()
+
+        self._find(items, "Dictation model").action.items[1].action(None, None)
+        self._find(items, "Meeting model").action.items[0].action(None, None)
+
+        tray.dictation.select_dictation_model.assert_called_once_with("Multi-language")
+        tray.dictation.select_meeting_model.assert_called_once_with("English fast")
+
+    def test_submenus_disabled_when_switching_not_allowed(self):
+        _, items = self._tray(can_switch_model=lambda: False)
+
+        assert self._find(items, "Dictation model").is_enabled() is False
+        assert self._find(items, "Meeting model").is_enabled() is False
+
+    def test_dictation_title_shows_loading(self):
+        _, items = self._tray(
+            model_loaded=SimpleNamespace(is_set=lambda: False), dictation_label="Multi-language",
+        )
+
+        assert self._find(items, "Dictation model").title() == "Dictation model: loading Multi-language…"
+
+    def test_meeting_title_shows_download(self):
+        _, items = self._tray(meeting_label="English fast", meeting_download_label="English fast")
+
+        assert self._find(items, "Meeting model").title() == "Meeting model: downloading English fast…"
+
+    def test_signature_changes_on_selection(self):
+        tray, _ = self._tray()
+        before = tray._menu_signature()
+
+        tray.dictation.meeting_label = "English fast"
+
+        assert tray._menu_signature() != before
+
+    def test_signature_changes_when_switching_becomes_blocked(self):
+        tray, _ = self._tray()
+        before = tray._menu_signature()
+
+        tray.dictation.can_switch_model = lambda: False
+
+        assert tray._menu_signature() != before
+
+    def test_without_models_keeps_plain_row_and_no_submenus(self):
+        _, items = self._tray(model_choices=[])
+        titles = self._titles(items)
+
+        assert "Model: base.en" in titles
+        assert not [t for t in titles if t and t.startswith(("Dictation model", "Meeting model"))]
+
+    def test_meeting_audio_is_a_submenu_after_restart_listener(self):
+        _, items = self._tray(model_choices=[])
+        titles = self._titles(items)
+
+        index = titles.index("Restart hotkey listener")
+        audio = items[index + 1]
+        assert audio.title().startswith("Meeting audio:")
+        assert audio.is_enabled() is True
+        assert self._titles(audio.action.items) == [
+            "Delete recorded audio files", "Open recorded audio folder",
+        ]
+
+    def test_audio_actions_left_the_top_level(self):
+        _, items = self._tray(model_choices=[])
+        titles = self._titles(items)
+
+        assert "Delete recorded audio files" not in titles
+        assert "Open recorded audio folder" not in titles
+
+
+class TestMeetingFlagsAfterTranscription:
+    def test_flag_clears_so_switching_is_allowed_again(self, mock_config, created_models, monkeypatch, tmp_path):
+        d = _loaded(dictate.Dictation(_models_config(mock_config)))
+        monkeypatch.setattr(dictate.meeting_mod, "finish_session", lambda *a: tmp_path / "out.md")
+
+        d._transcribe_meeting(tmp_path)
+
+        assert d.meeting_transcribing is False
+        assert d.can_switch_model() is True
+
+    def test_loading_the_model_is_visible_as_progress(self, mock_config, monkeypatch):
+        seen = []
+        holder = {}
+
+        def factory(name, **kwargs):
+            if "cpu_threads" in kwargs:
+                seen.append(holder["dictation"].meeting_progress)
+            return MagicMock()
+
+        monkeypatch.setattr(dictate, "WhisperModel", factory)
+        holder["dictation"] = d = _loaded(dictate.Dictation(_models_config(mock_config)))
+
+        d.meeting_model()
+
+        assert seen == ["loading model"]
+
+
+class TestTerminateProcess:
+    def test_flushes_logs_then_exits_with_code(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(dictate.logging, "shutdown", lambda: events.append("flush"))
+        monkeypatch.setattr(dictate.os, "_exit", lambda code: events.append(code))
+
+        _real_terminate_process(dictate.FATAL_EXIT_CODE)
+
+        assert events == ["flush", dictate.FATAL_EXIT_CODE]
+
+
+class TestLaunchdRestart:
+    def test_unloads_service_when_running_under_launchd(self, monkeypatch):
+        run = MagicMock()
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        monkeypatch.setenv("XPC_SERVICE_NAME", dictate.LAUNCHD_LABEL)
+        monkeypatch.setattr(dictate.subprocess, "run", run)
+
+        dictate._prevent_launchd_restart()
+
+        args = run.call_args[0][0]
+        assert args[:2] == ["launchctl", "bootout"]
+        assert args[2].endswith(f"/{dictate.LAUNCHD_LABEL}")
+
+    def test_does_nothing_outside_launchd(self, monkeypatch):
+        run = MagicMock()
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+        monkeypatch.setattr(dictate.subprocess, "run", run)
+
+        dictate._prevent_launchd_restart()
+
+        run.assert_not_called()
+
+
+class TestFreedModelMemoryIsReturned:
+    """glibc keeps a dropped model's pages; RSS stays near the loaded size without a trim."""
+
+    def test_switch_returns_memory_before_loading_the_next_model(self, mock_config, monkeypatch):
+        events = []
+        monkeypatch.setattr(dictate, "release_freed_memory", lambda: events.append("release"))
+
+        def factory(name, **kwargs):
+            events.append(name)
+            return MagicMock()
+
+        monkeypatch.setattr(dictate, "WhisperModel", factory)
+        d = _loaded(dictate.Dictation(_models_config(mock_config)))
+
+        d.select_dictation_model("Multi-language")
+
+        _loaded(d)
+        assert events == ["base.en", "release", "small"]
+
+    def test_meeting_transcription_returns_memory_when_done(
+        self, mock_config, created_models, monkeypatch, tmp_path
+    ):
+        released = []
+        d = _loaded(dictate.Dictation(_models_config(mock_config)))
+        monkeypatch.setattr(dictate.meeting_mod, "finish_session", lambda *a: tmp_path / "out.md")
+        monkeypatch.setattr(
+            dictate, "release_freed_memory", lambda: released.append(d._meeting_model)
+        )
+        d._meeting_model = MagicMock()
+
+        d._transcribe_meeting(tmp_path)
+
+        assert released == [None]
+
+    def test_trim_is_skipped_on_macos(self, monkeypatch):
+        cdll = MagicMock()
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        monkeypatch.setattr(dictate.ctypes, "CDLL", cdll)
+
+        dictate.release_freed_memory()
+
+        cdll.assert_not_called()
+
+    def test_trim_runs_on_linux(self, monkeypatch):
+        cdll = MagicMock()
+        monkeypatch.setattr(dictate, "IS_MACOS", False)
+        monkeypatch.setattr(dictate.ctypes, "CDLL", cdll)
+
+        dictate.release_freed_memory()
+
+        cdll.return_value.malloc_trim.assert_called_once_with(0)
+
+    def test_libc_without_trim_is_tolerated(self, monkeypatch):
+        monkeypatch.setattr(dictate, "IS_MACOS", False)
+        monkeypatch.setattr(dictate.ctypes, "CDLL", MagicMock(side_effect=OSError("no libc")))
+
+        dictate.release_freed_memory()
+
+
+class _BlockingTray:
+    """A tray whose loop ends on stop(), as the real one does."""
+
+    def __init__(self):
+        self.stopped = threading.Event()
+
+    def run_blocking(self):
+        self.stopped.wait(5)
+
+    def stop(self):
+        self.stopped.set()
+
+
+class TestFatalExitOutlivesMainThread:
+    """The worker thread must get to exit with the code before the main thread returns."""
+
+    def _run_until_fatal(self, d, monkeypatch):
+        finishing = threading.Event()
+        reached = threading.Event()
+
+        def slow_launchd_step():
+            reached.set()
+            finishing.wait(5)
+
+        monkeypatch.setattr(dictate, "_prevent_launchd_restart", slow_launchd_step)
+        runner = threading.Thread(target=d.run, daemon=True)
+        runner.start()
+        threading.Thread(target=d._exit_fatally, args=("Failed", "reason"), daemon=True).start()
+        assert reached.wait(5)
+        return runner, finishing
+
+    def test_tray_path_does_not_return_before_the_exit(self, mock_config, monkeypatch, fatal_exit):
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+        d.config["tray_icon"] = True
+        tray = _BlockingTray()
+        monkeypatch.setattr(d, "_start_tray_or_exit", lambda: tray)
+        monkeypatch.setattr(d, "_run_supervisor_loop", lambda: None)
+
+        runner, finishing = self._run_until_fatal(d, monkeypatch)
+
+        assert tray.stopped.wait(5)
+        runner.join(0.4)
+        assert runner.is_alive()
+        finishing.set()
+        assert fatal_exit.event.wait(5)
+        assert fatal_exit.codes == [dictate.FATAL_EXIT_CODE]
+
+    def test_no_tray_path_does_not_return_before_the_exit(self, mock_config, monkeypatch, fatal_exit):
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+        monkeypatch.setattr(d, "_start_hotkey_listener", MagicMock())
+        d._keyboard_listener = None
+
+        runner, finishing = self._run_until_fatal(d, monkeypatch)
+
+        runner.join(0.6)
+        assert runner.is_alive()
+        finishing.set()
+        assert fatal_exit.event.wait(5)
+
+    def test_normal_shutdown_still_returns(self, mock_config, monkeypatch):
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+        d.config["tray_icon"] = True
+        tray = _BlockingTray()
+        tray.stop()
+        monkeypatch.setattr(d, "_start_tray_or_exit", lambda: tray)
+        monkeypatch.setattr(d, "_run_supervisor_loop", lambda: None)
+
+        runner = threading.Thread(target=d.run, daemon=True)
+        runner.start()
+        runner.join(2)
+
+        assert not runner.is_alive()
+
+    def test_failed_launchctl_does_not_prevent_the_exit(self, mock_config, monkeypatch, fatal_exit):
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+        monkeypatch.setattr(dictate, "IS_MACOS", True)
+        monkeypatch.setenv("XPC_SERVICE_NAME", dictate.LAUNCHD_LABEL)
+        monkeypatch.setattr(dictate.subprocess, "run", MagicMock(side_effect=OSError("no launchctl")))
+
+        d._exit_fatally("Failed", "reason")
+
+        assert fatal_exit.codes == [dictate.FATAL_EXIT_CODE]
+
+
+class TestSwitchWaitsForStreamingWorker:
+    def test_refused_while_worker_still_drains_the_queue(self, mock_config):
+        d = _loaded(dictate.StreamingDictation(dictate.load_config()))
+        release = threading.Event()
+        d.transcription_thread = threading.Thread(target=release.wait, args=(5,), daemon=True)
+        d.transcription_thread.start()
+
+        assert d.can_switch_model() is False
+
+        release.set()
+        d.transcription_thread.join(5)
+        assert d.can_switch_model() is True
+
+
+class TestNoSwitchWindowWhileStopping:
+    """Between clearing `recording` and marking the next phase, a switch must stay refused."""
+
+    @pytest.mark.parametrize("cls_name", ["Dictation", "StreamingDictation"])
+    def test_switch_refused_when_recording_clears(self, mock_config, cls_name):
+        seen = []
+
+        class Probe(getattr(dictate, cls_name)):
+            def __setattr__(self, name, value):
+                super().__setattr__(name, value)
+                if name == "recording" and value is False and getattr(self, "probing", False):
+                    seen.append(self.can_switch_model())
+
+        d = _loaded(Probe(dictate.load_config()))
+        d.recording = True
+        d.probing = True
+
+        d.stop_recording()
+
+        assert seen == [False]
+
+
+class TestPercentInModelsConfig:
+    def _config(self, mock_config, models, dictation="Fast 100%", meeting="Fast 100%"):
+        text = mock_config.read_text().replace(
+            "[behavior]\n",
+            f"[behavior]\nmodels = {models}\ndictation_model = {dictation}\nmeeting_model = {meeting}\n",
+            1,
+        )
+        mock_config.write_text(text)
+        return dictate.load_config()
+
+    def test_percent_is_allowed_in_label(self, mock_config):
+        config = self._config(mock_config, "Fast 100%:whisper:base")
+
+        assert config["model_choices"][0].label == "Fast 100%"
+        assert config["dictation_model"] == "Fast 100%"
+
+    def test_percent_is_allowed_in_model_path(self, mock_config):
+        config = self._config(
+            mock_config, "Local:whisper:/models/100%/base", dictation="Local", meeting="Local"
+        )
+
+        assert config["model_choices"][0].model == "/models/100%/base"
+
+
+class TestStartMeetingBlocksSwitch:
+    def test_switch_during_recorder_start_is_refused(self, mock_config, monkeypatch):
+        d = _loaded(dictate.Dictation(_models_config(mock_config)))
+        before = d.dictation_label
+
+        class Recorder:
+            session_dir = "x"
+
+            def __init__(self, **kwargs):
+                pass
+
+            def start(self):
+                attempt = threading.Thread(
+                    target=d.select_dictation_model, args=("Multi-language",), daemon=True
+                )
+                attempt.start()
+                attempt.join(0.2)
+                self.attempt = attempt
+
+            def stop(self):
+                pass
+
+        monkeypatch.setattr(dictate.meeting_mod, "MeetingRecorder", Recorder)
+
+        d.start_meeting()
+        d.meeting.attempt.join(2)
+
+        assert d.meeting_active is True
+        assert d.dictation_label == before
+        d._meeting_stop_event.set()
+
+
+class TestTrayMenuRefreshAndTooltip:
+    def _tray(self, **kw):
+        import tray_status
+
+        base = dict(
+            model_error=None, _tray_error=None, recording=False, stopping=False,
+            transcribing=False, meeting_active=False, meeting_transcribing=False,
+            meeting_progress=None, config={"model": "base"}, model_choices=[],
+            dictation_label=None, meeting_label=None, meeting_download_label=None,
+            can_switch_model=lambda: True,
+            model_loaded=SimpleNamespace(is_set=lambda: True),
+        )
+        base.update(kw)
+        return tray_status.TrayStatus(SimpleNamespace(**base))
+
+    def test_signature_changes_when_meeting_transcription_ends(self):
+        tray = self._tray(meeting_transcribing=True)
+        before = tray._menu_signature()
+
+        tray.dictation.meeting_transcribing = False
+
+        assert tray._menu_signature() != before
+
+    def test_signature_changes_when_meeting_model_starts_loading(self):
+        tray = self._tray(meeting_transcribing=True)
+        before = tray._menu_signature()
+
+        tray.dictation.meeting_progress = dictate.meeting_mod.PROGRESS_LOADING_MODEL
+
+        assert tray._menu_signature() != before
+
+    def test_signature_changes_when_loading_gives_way_to_progress(self):
+        tray = self._tray(
+            meeting_transcribing=True, meeting_progress=dictate.meeting_mod.PROGRESS_LOADING_MODEL
+        )
+        before = tray._menu_signature()
+
+        tray.dictation.meeting_progress = "mic 0%"
+
+        assert tray._menu_signature() != before
+
+    def test_percentage_ticks_do_not_rebuild_an_open_menu(self):
+        tray = self._tray(meeting_transcribing=True, meeting_progress="mic 10%")
+        before = tray._menu_signature()
+
+        tray.dictation.meeting_progress = "mic 11%"
+
+        assert tray._menu_signature() == before
+
+    def test_delete_refreshes_the_meeting_audio_title(self, monkeypatch):
+        tray = self._tray()
+        monkeypatch.setattr(dictate.meeting_mod, "purge_wavs", lambda *a, **k: 0)
+        tray._last_menu_signature = tray._menu_signature()
+
+        tray._on_purge_meeting_audio(MagicMock(), None)
+
+        assert tray._last_menu_signature is None
+
+    def test_tooltip_names_the_model_being_loaded(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            config={"model": "base.en"}, dictation_label="Multi-language",
+            model_error=None, _tray_error=None,
+        )
+
+        assert "Multi-language" in tray_status.tooltip_for(d, "loading")
+
+    def test_tooltip_without_models_shows_the_configured_model(self):
+        import tray_status
+
+        d = SimpleNamespace(config={"model": "base.en"}, model_error=None, _tray_error=None)
+
+        assert "base.en" in tray_status.tooltip_for(d, "loading")
+
+
+class TestRealPystrayMenu:
+    """The fakes above don't enforce pystray's rules, such as its limit on action parameters."""
+
+    def test_model_submenu_works_with_real_pystray(self, monkeypatch):
+        monkeypatch.setenv("PYSTRAY_BACKEND", "dummy")
+        from pystray import Menu, MenuItem
+        import tray_status
+
+        select = MagicMock()
+        d = SimpleNamespace(
+            model_error=None, _tray_error=None, recording=False, stopping=False,
+            transcribing=False, meeting_active=False, meeting_transcribing=False,
+            meeting_progress=None, config={"model": "base"},
+            model_choices=[
+                dictate.ModelChoice("English", "whisper", "base.en"),
+                dictate.ModelChoice("Multi", "whisper", "base"),
+            ],
+            dictation_label="English", meeting_label="Multi", meeting_download_label=None,
+            can_switch_model=lambda: True, select_dictation_model=select,
+            select_meeting_model=MagicMock(), model_loaded=SimpleNamespace(is_set=lambda: True),
+        )
+        items = tray_status.TrayStatus(d)._build_menu(Menu, MenuItem).items
+        row = next(i for i in items if i.text.startswith("Dictation model"))
+        english, multi = row.submenu.items
+
+        assert (english.text, english.checked, english.radio) == ("English", True, True)
+        assert multi.checked is False
+        multi(MagicMock())
+        select.assert_called_once_with("Multi")

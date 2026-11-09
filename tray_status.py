@@ -93,6 +93,10 @@ def config_flag(dictation: Any, key: str, default: bool = True) -> bool:
 
 def language_label(dictation: Any) -> tuple[str, bool]:
     """Return (label, from_layout) for the language badge / menu line."""
+    import meeting
+
+    if meeting.is_english_only_model(getattr(dictation, "model", None)):
+        return "EN", False
     session = getattr(dictation, "_session_enforced_language", None)
     if session:
         return session.upper(), True
@@ -112,6 +116,7 @@ def tooltip_for(dictation: Any, state: str) -> str:
         hotkey = (get_name() or "F12").upper()
     config = getattr(dictation, "config", None) or {}
     model = config.get("model", "model") if isinstance(config, dict) else "model"
+    model = getattr(dictation, "dictation_label", None) or model
     err = getattr(dictation, "model_error", None) or getattr(dictation, "_tray_error", None)
 
     if state == "loading":
@@ -338,30 +343,7 @@ class TrayStatus:
         image = self._image_for(state, badge)
         title = self._title_for(state)
 
-        menu = Menu(
-            MenuItem(lambda item: self._state_menu_text(), None, enabled=False),
-            MenuItem(lambda item: self._model_menu_text(), None, enabled=False),
-            MenuItem(lambda item: self._language_menu_text(), None, enabled=False),
-            Menu.SEPARATOR,
-            MenuItem(
-                self._toggle_menu_text,
-                self._on_toggle_dictation,
-                enabled=self._toggle_enabled,
-            ),
-            MenuItem(
-                self._meeting_menu_text,
-                self._on_toggle_meeting,
-                enabled=self._meeting_enabled,
-            ),
-            MenuItem(lambda item: self._meeting_disk_text(), None, enabled=False),
-            MenuItem("Delete recorded audio files", self._on_purge_meeting_audio),
-            MenuItem("Open recorded audio folder", self._on_open_meeting_audio),
-            Menu.SEPARATOR,
-            MenuItem("Restart hotkey listener", self._on_restart_listener),
-            MenuItem("Open log", self._on_open_log),
-            MenuItem("Open config", self._on_open_config),
-            MenuItem("Quit", self._on_quit),
-        )
+        menu = self._build_menu(Menu, MenuItem)
 
         try:
             self._icon = pystray.Icon(
@@ -495,9 +477,113 @@ class TrayStatus:
             except Exception as e:
                 logger.debug("Could not schedule set_label: %s", e)
 
+    def _build_menu(self, Menu, MenuItem):
+        return Menu(
+            MenuItem(lambda item: self._state_menu_text(), None, enabled=False),
+            *self._model_rows(Menu, MenuItem),
+            MenuItem(lambda item: self._language_menu_text(), None, enabled=False),
+            Menu.SEPARATOR,
+            MenuItem(
+                self._toggle_menu_text,
+                self._on_toggle_dictation,
+                enabled=self._toggle_enabled,
+            ),
+            MenuItem(
+                self._meeting_menu_text,
+                self._on_toggle_meeting,
+                enabled=self._meeting_enabled,
+            ),
+            Menu.SEPARATOR,
+            MenuItem("Restart hotkey listener", self._on_restart_listener),
+            MenuItem(
+                lambda item: self._meeting_disk_text(),
+                Menu(
+                    MenuItem("Delete recorded audio files", self._on_purge_meeting_audio),
+                    MenuItem("Open recorded audio folder", self._on_open_meeting_audio),
+                ),
+            ),
+            MenuItem("Open log", self._on_open_log),
+            MenuItem("Open config", self._on_open_config),
+            MenuItem("Quit", self._on_quit),
+        )
+
+    def _model_rows(self, Menu, MenuItem) -> list:
+        """Model submenus when [behavior] models is set, else the plain status row."""
+        if not self._model_choices():
+            return [MenuItem(lambda item: self._model_menu_text(), None, enabled=False)]
+        return [
+            MenuItem(
+                lambda item: self._dictation_model_text(),
+                self._model_submenu(Menu, MenuItem, "dictation_label", "select_dictation_model"),
+                enabled=lambda item: self._model_switch_enabled(),
+            ),
+            MenuItem(
+                lambda item: self._meeting_model_text(),
+                self._model_submenu(Menu, MenuItem, "meeting_label", "select_meeting_model"),
+                enabled=lambda item: self._model_switch_enabled(),
+            ),
+        ]
+
+    def _model_submenu(self, Menu, MenuItem, active_attr: str, select_method: str):
+        return Menu(*(
+            self._model_item(MenuItem, choice.label, active_attr, select_method)
+            for choice in self._model_choices()
+        ))
+
+    def _model_item(self, MenuItem, label: str, active_attr: str, select_method: str):
+        # A named closure, because pystray rejects actions with more than two
+        # parameters, which rules out binding `label` as a lambda default.
+        def on_select(icon, item) -> None:
+            getattr(self.dictation, select_method)(label)
+
+        def is_active(item) -> bool:
+            return getattr(self.dictation, active_attr) == label
+
+        return MenuItem(label, on_select, checked=is_active, radio=True)
+
+    def _model_choices(self) -> list:
+        return getattr(self.dictation, "model_choices", None) or []
+
+    def _dictation_model_text(self) -> str:
+        label = self.dictation.dictation_label
+        if not self.dictation.model_loaded.is_set():
+            return f"Dictation model: loading {label}…"
+        return f"Dictation model: {label}"
+
+    def _meeting_model_text(self) -> str:
+        downloading = self.dictation.meeting_download_label
+        if downloading:
+            return f"Meeting model: downloading {downloading}…"
+        return f"Meeting model: {self.dictation.meeting_label}"
+
+    def _model_switch_enabled(self) -> bool:
+        return self.dictation.can_switch_model()
+
+    def _model_rows_signature(self) -> tuple:
+        if not self._model_choices():
+            return ()
+        return (
+            self._dictation_model_text(),
+            self._meeting_model_text(),
+            self._model_switch_enabled(),
+        )
+
+    def _meeting_rows_signature(self) -> tuple:
+        """The meeting phase only: a rebuild per percent would keep closing an open menu."""
+        import meeting
+
+        progress = getattr(self.dictation, "meeting_progress", None)
+        return (
+            self._meeting_enabled(),
+            getattr(self.dictation, "meeting_active", False),
+            progress == meeting.PROGRESS_LOADING_MODEL,
+        )
+
     def _menu_signature(self) -> tuple:
         """Stable snapshot of dynamic menu fields (avoid needless rebuilds)."""
         return (
+            *self._model_rows_signature(),
+            *self._meeting_rows_signature(),
             derive_state(self.dictation),
             self._state_menu_text(),
             self._model_menu_text(),
@@ -614,6 +700,8 @@ class TrayStatus:
             logger.info("Deleted meeting audio, freed %.0f MB", freed / 1e6)
         except Exception as e:
             logger.error("Could not delete meeting audio: %s", e, exc_info=True)
+        # The size is too costly to poll, so ask for a rebuild to show the new one.
+        self._last_menu_signature = None
 
     def _on_open_meeting_audio(self, icon, item) -> None:
         root = self._meeting_tmp_root()
