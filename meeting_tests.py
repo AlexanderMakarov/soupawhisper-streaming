@@ -1303,3 +1303,46 @@ class TestLanguageContextBounds:
         audio = np.arange(600, dtype=np.float32)
         runs = [(0, 300), (300, 600)]
         np.testing.assert_array_equal(meeting._language_context(audio, runs, 0, 10), audio[:300])
+
+
+class NoDetectorModel:
+    """Like ParakeetModel: transcribe() only, no detect_language()."""
+
+    def __init__(self):
+        self.calls = []
+
+    def transcribe(self, audio, **kw):
+        self.calls.append(kw.get("language"))
+        return [FakeSegment(0.0, 1.0, "text")], SimpleNamespace(duration=len(audio) / 16000)
+
+
+class TestMeetingLanguageWithoutDetector:
+    """Parakeet meetings use one language: the layout's when the meeting started."""
+
+    def audio(self):
+        return np.zeros(20 * 16000, dtype=np.float32)
+
+    def test_every_run_uses_the_meeting_language(self):
+        model = NoDetectorModel()
+
+        meeting.transcribe_runs(
+            model, self.audio(), allowlist=["en", "ru"], language="ru",
+            find_runs=runs_at((1.0, 3.0), (8.0, 9.0), (15.0, 18.0)),
+        )
+
+        assert model.calls == ["ru", "ru", "ru"]
+
+    def test_unmapped_layout_passes_no_language(self):
+        model = NoDetectorModel()
+
+        meeting.transcribe_runs(model, self.audio(), find_runs=runs_at((1.0, 3.0)))
+
+        assert model.calls == [None]
+
+    def test_whisper_ignores_the_meeting_language(self):
+        model = WindowModel()
+
+        meeting.transcribe_runs(model, self.audio(), language="ru", find_runs=runs_at((1.0, 3.0)))
+
+        # WindowModel's detector says "en"; Whisper keeps per-run detection.
+        assert model.calls == ["en"]

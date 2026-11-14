@@ -104,7 +104,10 @@ def language_label(dictation: Any) -> tuple[str, bool]:
     config = getattr(dictation, "config", None) or {}
     if isinstance(config, dict):
         configured = config.get("language")
-    if configured:
+    # Parakeet ignores [whisper] language; only the layout picks its language.
+    import parakeet
+
+    if configured and not isinstance(getattr(dictation, "model", None), parakeet.ParakeetModel):
         return str(configured).upper(), False
     return "AUTO", False
 
