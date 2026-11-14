@@ -94,7 +94,10 @@ def build_model(engine: str, model_id: str, config: dict, cpu_threads: Optional[
         # Default to half the logical cores: on 4 cores / 8 threads, 4 beat 2 and 8.
         threads = cpu_threads or max(1, (os.cpu_count() or 2) // 2)
         return parakeet_mod.ParakeetModel(
-            model_id, cpu_threads=threads, script_penalty=config.get("parakeet_script_penalty"),
+            model_id, cpu_threads=threads,
+            script_penalty=config.get("parakeet_script_penalty"),
+            glossary=_parse_custom_terms(config.get("custom_terms") or ""),
+            language_allowlist=config.get("language_allowlist"),
         )
     kwargs = {"cpu_threads": cpu_threads} if cpu_threads else {}
     return WhisperModel(
@@ -103,8 +106,9 @@ def build_model(engine: str, model_id: str, config: dict, cpu_threads: Optional[
 
 
 def uses_layout_language(model) -> bool:
-    """Parakeet can't detect or be told a language other than by its alphabet, so the
-    keyboard layout always decides it."""
+    """Parakeet dictation always follows the keyboard layout, as if
+    enforce_language_from_layout were on: its language detection only tells
+    alphabets apart, and the layout is a stronger hint for the field being typed in."""
     return isinstance(model, parakeet_mod.ParakeetModel)
 
 
@@ -637,10 +641,11 @@ def load_config():
     model_choices, dictation_label, meeting_label = _read_model_selection(config)
     penalty_raw = config.get("parakeet", "script_penalty", fallback="").strip()
     try:
-        script_penalty = (
-            parakeet_mod.parse_script_penalty(penalty_raw) if penalty_raw
-            else dict(parakeet_mod.DEFAULT_SCRIPT_PENALTY)
-        )
+        # Entries override the defaults one language at a time, so "ru:5" keeps uk and bg.
+        script_penalty = {
+            **parakeet_mod.DEFAULT_SCRIPT_PENALTY,
+            **(parakeet_mod.parse_script_penalty(penalty_raw) if penalty_raw else {}),
+        }
     except ValueError as e:
         raise ConfigError(f"[parakeet] script_penalty: {e}") from None
     startup_model = next(
@@ -1015,8 +1020,6 @@ class Dictation:
         self._held_modifiers: set[str] = set()
         self._modifier_source = active_modifiers_x11
         self._meeting_model = None
-        # Layout language when the meeting started; used by models that can't detect one.
-        self.meeting_language: Optional[str] = None
         self.meeting_transcribing = False
         self.meeting_progress: Optional[str] = None
         self.model = None
@@ -1426,12 +1429,12 @@ class Dictation:
         Does not re-check during a running session (determinism + fewer layout queries).
         """
         self._session_enforced_language = None
-        if not uses_layout_language(self.model):
-            if not self.config.get("enforce_language_from_layout", False):
-                return
-            if self.config.get("language") is not None:
-                # Fixed whisper language: don't override.
-                return
+        if not (self.config.get("enforce_language_from_layout", False)
+                or uses_layout_language(self.model)):
+            return
+        if self.config.get("language") is not None:
+            # Fixed language: don't override.
+            return
         layout_id = detect_current_keyboard_layout()
         mapped = self._layout_to_language_map.get(layout_id) if layout_id else None
         lang = detect_current_keyboard_language(self._layout_to_language_map)
@@ -1532,8 +1535,15 @@ class Dictation:
         """Pick the decode language: layout override, else configured or detected."""
         enforced = self._maybe_enforced_language_for_field()
         if uses_layout_language(self.model):
-            # None (unmapped layout) leaves every alphabet allowed.
-            return enforced
+            # Whisper's rules, but nothing to ask detect_language: None makes the
+            # model pick among the allowlist's alphabets itself.
+            configured_lang = self.config.get("language")
+            allowlist = self.config.get("language_allowlist")
+            if configured_lang is not None:
+                return configured_lang
+            if enforced and (not allowlist or enforced in allowlist):
+                return enforced
+            return None
         configured_lang = self.config.get("language")
         allowlist = self.config.get("language_allowlist")
         # Only override in auto mode. If allowlist exists, enforce only if it is allowed.
@@ -1605,11 +1615,7 @@ class Dictation:
             self._tray_error = f"Meeting recording failed: {start_error}"
             self.notify("Meeting", f"Could not start recording: {start_error}", logging.ERROR, 5000)
             return
-        self.meeting_language = detect_current_keyboard_language(self._layout_to_language_map)
-        logger.info(
-            "[meeting] Recording to %s (layout language: %s)",
-            self.meeting.session_dir, self.meeting_language or "unmapped",
-        )
+        logger.info("[meeting] Recording to %s", self.meeting.session_dir)
         self.notify("Meeting", "Recording started (dictation paused)", logging.INFO, 2500)
         self._meeting_stop_event.clear()
         self._meeting_watchdog = threading.Thread(

@@ -2,15 +2,21 @@
 
 Only the part of the WhisperModel API this app uses is provided: ``transcribe()``
 returning ``(segments, info)``, where segments carry text, start/end, avg_logprob
-and optional words. There is deliberately no ``detect_language()``: Parakeet has no
-language detector, so callers check ``hasattr(model, "detect_language")`` and take
-the language from the keyboard layout instead.
+and optional words.
+
+Parakeet takes no language: it hears the language and writes pieces from one shared
+vocabulary of all its alphabets. Its typical mistake is the wrong alphabet (accented
+English written in Cyrillic), so a "language" here selects an alphabet mask. With
+``language=None`` the model detects the alphabet itself: it encodes the audio once,
+decodes it once per alphabet of ``language_allowlist`` and keeps the decode with the
+best confidence and coverage. There is deliberately no ``detect_language()``;
+callers check ``hasattr(model, "detect_language")`` and pass ``language=None``.
 
 Decoding is onnx-asr's greedy TDT loop, re-implemented here so that each call can
 change token scores before the pick, without touching shared model state:
 - a script mask keeps output in the layout language's alphabet (Parakeet otherwise
   writes accented English in Cyrillic and vice versa);
-- a glossary bonus nudges tokens that start or continue a custom term.
+- a glossary bonus nudges the next piece of a custom term once the term has begun.
 Both were measured in spikes/2026-11-13-parakeet (REPORT.md).
 
 The greedy loop uses onnx-asr private methods (``_encode``, ``_decode``,
@@ -40,9 +46,16 @@ EDGE_PAD_S = 0.3
 # Glossary bonus added to a token's score (log space). 2.0 fixed "agent session" ->
 # "agentic session" in the spike without inserting terms where none were spoken.
 GLOSSARY_BONUS = 2.0
-# A glossary term may only be *started* by a first piece at least this long
-# (" Kube", not " m"), so short common pieces don't pull terms into the text.
-GLOSSARY_MIN_START_PIECE = 4
+# Longest audio encoded in one pass. The encoder's attention grows with the square
+# of the length (a 1-hour file would need tens of GB), so longer audio is split at
+# pauses into speech pieces of at most this length, as Whisper splits into 30 s windows.
+MAX_PASS_S = 30.0
+# Alphabet detection score = mean token log probability + COVERAGE_WEIGHT *
+# log(share of the audio covered by decoded tokens). The coverage term stops a short
+# confident fragment from beating a full transcript in the other alphabet: on a 21 s
+# Russian run, the Latin decode "5-7-10. Technical challenge." averaged -0.12 and
+# the full Russian text -0.13. Not yet validated on more mixed recordings.
+COVERAGE_WEIGHT = 1.0
 
 # Parakeet TDT 0.6B v3 languages and the alphabet each is written in.
 SCRIPT_OF_LANGUAGE = {
@@ -55,13 +68,26 @@ SCRIPT_OF_LANGUAGE = {
     "el": "GREEK",
 }
 
-# Hesitation sounds Parakeet transcribes and Whisper drops. Compared after lowercasing
-# and stripping punctuation; only whole words are removed.
-FILLER_WORDS = frozenset({
-    "uh", "uhh", "um", "umm", "uhm", "er", "erm", "ah", "eh", "hmm", "hm", "mm", "mhm",
-    "mm-hmm", "uh-huh",
-    "э", "ээ", "эм", "мм", "хм",
+# Hesitation sounds Parakeet transcribes and Whisper drops. Only whole words are
+# removed, compared after lowercasing and stripping punctuation. A word is removed
+# only if it is a filler in the language being decoded: "er" and "um" are fillers in
+# English but real words in German ("er" = he, "um" = at) and Portuguese ("um" = a).
+# FILLERS_ANY_LANGUAGE holds sounds that are not a word in any Parakeet language;
+# it is all that applies when the language is unknown.
+FILLERS_ANY_LANGUAGE = frozenset({
+    "uh", "uhh", "umm", "uhm", "hmm", "hm", "mm", "mmm", "mhm", "mm-hmm", "uh-huh",
 })
+_CYRILLIC_FILLERS = frozenset({"э", "ээ", "эээ", "эм", "мм", "ммм", "хм"})
+FILLERS_BY_LANGUAGE: dict[str, frozenset[str]] = {
+    "en": frozenset({"um", "er", "erm"}),
+    "ru": _CYRILLIC_FILLERS,
+    "uk": _CYRILLIC_FILLERS,
+    "bg": _CYRILLIC_FILLERS,
+}
+
+
+def fillers_for(language: Optional[str]) -> frozenset[str]:
+    return FILLERS_ANY_LANGUAGE | FILLERS_BY_LANGUAGE.get(language or "", frozenset())
 
 _PUNCT = string.punctuation + "…«»“”„"
 
@@ -142,23 +168,24 @@ class TranscriptionInfo:
 
 
 class _Glossary:
-    """Token sequences for custom terms, used to boost them during decoding."""
+    """Token sequences of custom terms, used to boost the rest of a term once begun.
 
-    def __init__(self, terms: list[str], piece_to_id: dict[str, int], pieces: dict[int, str]):
+    Terms are not boosted from their first piece: the vocabulary splits them into
+    short, common pieces (Claude -> " C", "la", "ude"), so boosting those would pull
+    terms into ordinary words. A multi-word term ("ML repository") is one sequence.
+    """
+
+    def __init__(self, terms: list[str], piece_to_id: dict[str, int]):
         self.sequences: list[list[int]] = []
         for term in terms:
             for variant in {term, term.lower(), term[:1].upper() + term[1:]}:
                 seq = _encode_text(variant, piece_to_id)
-                if seq:
+                if len(seq) > 1 and seq not in self.sequences:
                     self.sequences.append(seq)
-        self.starters = frozenset(
-            seq[0] for seq in self.sequences
-            if len(pieces[seq[0]].strip()) >= GLOSSARY_MIN_START_PIECE
-        )
 
     def boosted(self, previous: list[int]) -> set[int]:
-        """Tokens that continue a term already under way, plus distinctive term starts."""
-        out = set(self.starters)
+        """Next pieces of every term whose beginning ends the text so far."""
+        out: set[int] = set()
         for seq in self.sequences:
             for k in range(min(len(seq) - 1, len(previous)), 0, -1):
                 if previous[-k:] == seq[:k]:
@@ -168,7 +195,11 @@ class _Glossary:
 
 
 def _encode_text(text: str, piece_to_id: dict[str, int]) -> list[int]:
-    """Greedy longest-match split into vocabulary pieces (a leading space starts a word)."""
+    """Greedy longest-match split into vocabulary pieces (a leading space starts a word).
+
+    Returns [] if any character has no piece: a sequence with letters skipped would
+    start mid-term and boost unrelated words.
+    """
     longest = max(map(len, piece_to_id))
     ids: list[int] = []
     for word in text.split():
@@ -180,7 +211,7 @@ def _encode_text(text: str, piece_to_id: dict[str, int]) -> list[int]:
                     rest = rest[n:]
                     break
             else:
-                rest = rest[1:]  # character the vocabulary lacks
+                return []
     return ids
 
 
@@ -204,7 +235,9 @@ class ParakeetModel:
     """A Parakeet TDT model with the WhisperModel calls this app makes."""
 
     def __init__(self, model_id: str = DEFAULT_MODEL, cpu_threads: int = 0,
-                 script_penalty: Optional[dict[str, Optional[float]]] = None):
+                 script_penalty: Optional[dict[str, Optional[float]]] = None,
+                 glossary: Optional[list[str]] = None,
+                 language_allowlist: Optional[list[str]] = None):
         import onnx_asr
         import onnxruntime as ort
         from onnx_asr.models.nemo import NemoConformerTdt
@@ -219,10 +252,12 @@ class ParakeetModel:
         asr = adapter.asr
         if not isinstance(asr, NemoConformerTdt):
             raise ValueError(f"{model_id!r} is not a Parakeet TDT model")
-        self._attach(asr, model_id, script_penalty)
+        self._attach(asr, model_id, script_penalty, glossary, language_allowlist)
 
     def _attach(self, asr, model_id: str,
-                script_penalty: Optional[dict[str, Optional[float]]] = None) -> None:
+                script_penalty: Optional[dict[str, Optional[float]]] = None,
+                glossary: Optional[list[str]] = None,
+                language_allowlist: Optional[list[str]] = None) -> None:
         """Index the vocabulary of a loaded onnx-asr TDT model (tests pass a fake)."""
         self.model_id = model_id
         self._script_penalty = dict(DEFAULT_SCRIPT_PENALTY if script_penalty is None else script_penalty)
@@ -237,8 +272,23 @@ class ParakeetModel:
         self._scripts = [frozenset() if tags[i] else _token_scripts(p) for i, p in self._pieces.items()]
         self._piece_to_id = {p: i for i, p in self._pieces.items() if not tags[i]}
         self._bias_cache: dict[Optional[str], np.ndarray] = {}
-        self._glossary_cache: dict[str, _Glossary] = {}
         self._cache_lock = threading.Lock()
+        # From [behavior] custom_terms. Whisper's joined `hotwords` string can't be used:
+        # it loses the boundaries of multi-word terms.
+        self._glossary = _Glossary(glossary, self._piece_to_id) if glossary else None
+        self._candidates = self._detection_candidates(language_allowlist or [])
+
+    def _detection_candidates(self, allowlist: list[str]) -> list[tuple[str, Optional[str]]]:
+        """(language to decode with, language to report) per distinct alphabet mask.
+
+        Languages sharing an alphabet and penalty decode identically, so they are
+        decoded once and reported as unknown (None): "en, de" can't be told apart.
+        """
+        groups: dict[tuple, list[str]] = {}
+        for lang in allowlist:
+            penalty = self._script_penalty.get(lang, self._script_penalty.get("*"))
+            groups.setdefault((SCRIPT_OF_LANGUAGE.get(lang), penalty), []).append(lang)
+        return [(langs[0], langs[0] if len(langs) == 1 else None) for langs in groups.values()]
 
     # --- per-call decoding knobs -------------------------------------------------
 
@@ -257,25 +307,20 @@ class ParakeetModel:
                 self._bias_cache[language] = bias
             return self._bias_cache[language]
 
-    def _glossary(self, hotwords: Optional[str]) -> Optional[_Glossary]:
-        if not hotwords:
-            return None
-        with self._cache_lock:
-            if hotwords not in self._glossary_cache:
-                self._glossary_cache[hotwords] = _Glossary(
-                    hotwords.split(), self._piece_to_id, self._pieces
-                )
-            return self._glossary_cache[hotwords]
-
     # --- decoding -----------------------------------------------------------------
 
     def _greedy(self, encodings: np.ndarray, length: int, bias: np.ndarray,
-                glossary: Optional[_Glossary]) -> tuple[list[int], list[int], list[float]]:
-        """onnx-asr's TDT greedy loop, with score edits before each pick."""
+                glossary: Optional[_Glossary]) -> tuple[list[int], list[int], list[int], list[float]]:
+        """onnx-asr's TDT greedy loop, with score edits before each pick.
+
+        Returns tokens, their first frame, their duration in frames (from the TDT
+        duration head; at least 1) and log probabilities.
+        """
         asr = self._asr
         state = asr._create_state()
         tokens: list[int] = []
         frames: list[int] = []
+        durations: list[int] = []
         logprobs: list[float] = []
         t = emitted = 0
         while t < length:
@@ -290,6 +335,7 @@ class ParakeetModel:
                 state = next_state
                 tokens.append(token)
                 frames.append(t)
+                durations.append(max(step, 1))
                 logprobs.append(float(_log_softmax(logits)[token]))
                 emitted += 1
             if step > 0:
@@ -298,7 +344,7 @@ class ParakeetModel:
             elif token == self._blank or emitted == asr._max_tokens_per_step:
                 t += 1
                 emitted = 0
-        return tokens, frames, logprobs
+        return tokens, frames, durations, logprobs
 
     def transcribe(
         self,
@@ -306,12 +352,12 @@ class ParakeetModel:
         language: Optional[str] = None,
         vad_filter: bool = False,
         vad_parameters=None,
-        hotwords: Optional[str] = None,
         word_timestamps: bool = False,
         **_whisper_only,
     ) -> tuple[list[Segment], TranscriptionInfo]:
-        """Transcribe 16 kHz mono audio. Whisper-only options (prompts, temperature,
-        condition_on_previous_text, ...) are accepted and ignored."""
+        """Transcribe 16 kHz mono audio of any length. Whisper-only options (prompts,
+        hotwords, temperature, condition_on_previous_text, ...) are accepted and
+        ignored; the glossary comes from the constructor."""
         if audio.dtype == np.int16:
             audio = audio.astype(np.float32) / 32768.0
         audio = np.asarray(audio, dtype=np.float32)
@@ -320,15 +366,66 @@ class ParakeetModel:
         if vad_filter and not self._has_speech(audio, vad_parameters):
             # Parakeet types "Yeah." / "Thank you." on breaths and noise.
             return [], info
+        if duration <= MAX_PASS_S:
+            pieces = [(0, len(audio))]
+        else:
+            pieces = self._speech_pieces(audio)
+        segments: list[Segment] = []
+        detected: list[Optional[str]] = []
+        for start, end in pieces:
+            offset = start / SAMPLE_RATE
+            piece_words, piece_language = self._decode_piece(audio[start:end], language)
+            detected.append(piece_language)
+            # Fillers depend on the language: "er" is English hesitation, German "he".
+            words = [
+                (Word(w.start + offset, w.end + offset, w.word, w.probability), lps)
+                for w, lps in drop_fillers(piece_words, piece_language)
+            ]
+            # Segments end at piece boundaries too: a pause between pieces ends a
+            # sentence even without punctuation, and the next piece may switch language.
+            segments.extend(_segments(words))
+        if language is None and detected:
+            info = TranscriptionInfo(max(detected, key=detected.count), 1.0, duration)
+        return segments, info
+
+    def _decode_piece(self, audio: np.ndarray, language: Optional[str]):
+        """Encode at most MAX_PASS_S of audio once; decode it in `language`, or in
+        each candidate alphabet when `language` is None. Returns (words, language)."""
         pad = np.zeros(int(EDGE_PAD_S * SAMPLE_RATE), np.float32)
         padded = np.concatenate([pad, audio, pad])[None, :]
         lengths = np.array([padded.shape[1]], np.int64)
         encoder_out, encoder_lens = self._asr._encode(*self._asr._preprocessor(padded, lengths))
-        tokens, frames, logprobs = self._greedy(
-            encoder_out[0], int(encoder_lens[0]), self._bias(language), self._glossary(hotwords)
+        encodings, length = encoder_out[0], int(encoder_lens[0])
+        duration = len(audio) / SAMPLE_RATE
+        if language is not None or len(self._candidates) < 2:
+            decode_as, report = (
+                (language, language) if language is not None
+                else self._candidates[0] if self._candidates else (None, None)
+            )
+            decoded = self._greedy(encodings, length, self._bias(decode_as), self._glossary)
+            return self._words(*decoded, duration=duration), report
+        best = None
+        scores = {}
+        for decode_as, report in self._candidates:
+            decoded = self._greedy(encodings, length, self._bias(decode_as), self._glossary)
+            score = detection_score(decoded[2], decoded[3], duration / self._frame_s)
+            scores[decode_as] = round(score, 2)
+            if best is None or score > best[0]:
+                best = (score, decoded, report)
+        logger.debug("Alphabet detection scores %s -> %s", scores, best[2])
+        return self._words(*best[1], duration=duration), best[2]
+
+    @staticmethod
+    def _speech_pieces(audio: np.ndarray) -> list[tuple[int, int]]:
+        """Split long audio at pauses into speech pieces no longer than MAX_PASS_S."""
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        options = VadOptions(
+            min_silence_duration_ms=500, speech_pad_ms=200,
+            # Silero cuts at the longest pause it can find before this length.
+            max_speech_duration_s=MAX_PASS_S - 1,
         )
-        words = self._words(tokens, frames, logprobs, duration)
-        return _segments(words), info
+        return [(run["start"], run["end"]) for run in get_speech_timestamps(audio, options)]
 
     @staticmethod
     def _has_speech(audio: np.ndarray, vad_parameters) -> bool:
@@ -338,13 +435,17 @@ class ParakeetModel:
             vad_parameters = VadOptions(**vad_parameters)
         return bool(get_speech_timestamps(audio, vad_parameters or VadOptions()))
 
-    def _words(self, tokens, frames, logprobs, duration) -> list[tuple[Word, list[float]]]:
-        """Group pieces into words (a leading space starts one), on the unpadded timeline."""
+    def _words(self, tokens, frames, durations, logprobs, duration) -> list[tuple[Word, list[float]]]:
+        """Group pieces into words (a leading space starts one), on the unpadded timeline.
+
+        A word ends where its last piece ends, by that piece's predicted duration, so
+        pauses between words stay visible in word and cue times.
+        """
         groups: list[list] = []  # [text, start, end, logprobs]
-        for i, (token, frame, lp) in enumerate(zip(tokens, frames, logprobs)):
+        for token, frame, length, lp in zip(tokens, frames, durations, logprobs):
             piece = self._pieces[token]
             start = frame * self._frame_s - EDGE_PAD_S
-            end = (frames[i + 1] if i + 1 < len(frames) else frame + 1) * self._frame_s - EDGE_PAD_S
+            end = (frame + length) * self._frame_s - EDGE_PAD_S
             if piece.startswith(" ") or not groups:
                 groups.append([piece.strip(), start, end, [lp]])
             else:
@@ -358,12 +459,22 @@ class ParakeetModel:
         ]
 
 
-def drop_fillers(words: list[tuple[Word, list[float]]]) -> list[tuple[Word, list[float]]]:
-    """Remove hesitation words, keeping sentence ends and sentence-initial capitals."""
+def detection_score(durations: list[int], logprobs: list[float], frames: float) -> float:
+    """Confidence of a decode, penalised by how little of the audio it covers."""
+    if not logprobs:
+        return float("-inf")
+    coverage = min(1.0, sum(durations) / max(frames, 1.0))
+    return float(np.mean(logprobs)) + COVERAGE_WEIGHT * float(np.log(coverage))
+
+
+def drop_fillers(words: list[tuple[Word, list[float]]],
+                 language: Optional[str] = None) -> list[tuple[Word, list[float]]]:
+    """Remove hesitation words of `language`, keeping sentence ends and capitals."""
+    fillers = fillers_for(language)
     kept: list[tuple[Word, list[float]]] = []
     capitalize_next = False
     for word, lps in words:
-        if _bare(word.word) in FILLER_WORDS:
+        if _bare(word.word) in fillers:
             ending = re.search(r"[.!?]+$", word.word)
             if ending and kept and not re.search(r"[.!?]$", kept[-1][0].word):
                 prev, prev_lps = kept[-1]
@@ -379,7 +490,6 @@ def drop_fillers(words: list[tuple[Word, list[float]]]) -> list[tuple[Word, list
 
 def _segments(words: list[tuple[Word, list[float]]]) -> list[Segment]:
     """One segment per sentence, ended by . ! or ?"""
-    words = drop_fillers(words)
     segments: list[Segment] = []
     current: list[tuple[Word, list[float]]] = []
     for item in words:

@@ -452,7 +452,6 @@ def transcribe_runs(
     transcribe_kwargs: dict | None = None,
     progress=None,
     find_runs=None,
-    language: str | None = None,
 ) -> list[Cue]:
     """Decode each speech run independently, resolving uncertain language scores
     with up to 30 seconds of nearby same-track audio.
@@ -465,8 +464,8 @@ def transcribe_runs(
     `allowlist` filters language candidates. `progress(done, total)` runs once per
     speech run; `transcribe_kwargs` forwards the shared glossary to the decoder.
     `find_runs` is injectable so tests can pin the segmentation.
-    A model without ``detect_language`` (Parakeet) decodes every run in `language`,
-    the layout language captured when the meeting started (None = any alphabet).
+    A model without ``detect_language`` (Parakeet) gets ``language=None`` and picks
+    each run's alphabet itself among the allowlist's; it reports it in ``info``.
     """
     settings = settings or RunSettings()
     detect = find_runs or speech_runs
@@ -478,20 +477,25 @@ def transcribe_runs(
     for index, (start, end) in enumerate(runs, 1):
         chunk = audio[start:end]
         offset, limit = start / sample_rate, end / sample_rate
-        if hasattr(model, "detect_language"):
+        detects_itself = not hasattr(model, "detect_language")
+        lang = None
+        if not detects_itself:
             context = _language_context(audio, runs, index - 1, sample_rate)
             lang = _detect_window_language(model, chunk, allowlist, context=context)
-        else:
-            lang = language
-        logger.info(
-            "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset, lang
-        )
+            logger.info(
+                "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset, lang
+            )
         extra = dict(transcribe_kwargs or {})
         if settings.word_timestamps:
             extra["word_timestamps"] = True
-        segments, _ = model.transcribe(
+        segments, info = model.transcribe(
             chunk, vad_filter=False, language=lang, **extra
         )
+        if detects_itself:
+            logger.info(
+                "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset,
+                getattr(info, "language", None),
+            )
         for seg in segments:
             text = seg.text.strip()
             if not text:
@@ -733,7 +737,6 @@ def finish_session(dictation, session_dir: Path, transcript_dir: Path) -> Path:
             tracks[name] = transcribe_runs(
                 model, audio, allowlist=allowlist, settings=settings,
                 transcribe_kwargs=glossary, progress=report,
-                language=getattr(dictation, "meeting_language", None),
             )
             if reject:
                 kept = [c for c in tracks[name] if not reject(c.text)]
