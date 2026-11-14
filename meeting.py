@@ -464,6 +464,8 @@ def transcribe_runs(
     `allowlist` filters language candidates. `progress(done, total)` runs once per
     speech run; `transcribe_kwargs` forwards the shared glossary to the decoder.
     `find_runs` is injectable so tests can pin the segmentation.
+    A model without ``detect_language`` (Parakeet) gets ``language=None`` and picks
+    each run's alphabet itself among the allowlist's; it reports it in ``info``.
     """
     settings = settings or RunSettings()
     detect = find_runs or speech_runs
@@ -475,17 +477,25 @@ def transcribe_runs(
     for index, (start, end) in enumerate(runs, 1):
         chunk = audio[start:end]
         offset, limit = start / sample_rate, end / sample_rate
-        context = _language_context(audio, runs, index - 1, sample_rate)
-        lang = _detect_window_language(model, chunk, allowlist, context=context)
-        logger.info(
-            "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset, lang
-        )
+        detects_itself = not hasattr(model, "detect_language")
+        lang = None
+        if not detects_itself:
+            context = _language_context(audio, runs, index - 1, sample_rate)
+            lang = _detect_window_language(model, chunk, allowlist, context=context)
+            logger.info(
+                "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset, lang
+            )
         extra = dict(transcribe_kwargs or {})
         if settings.word_timestamps:
             extra["word_timestamps"] = True
-        segments, _ = model.transcribe(
+        segments, info = model.transcribe(
             chunk, vad_filter=False, language=lang, **extra
         )
+        if detects_itself:
+            logger.info(
+                "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset,
+                getattr(info, "language", None),
+            )
         for seg in segments:
             text = seg.text.strip()
             if not text:

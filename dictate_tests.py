@@ -2470,7 +2470,7 @@ class TestModelChoicesConfig:
         "Label::tiny",
         "A:whisper:tiny,,B:whisper:small",
         "A:whisper:tiny, A:whisper:small",
-        "A:parakeet:tiny",
+        "A:vosk:tiny",
     ])
     def test_invalid_list_is_rejected(self, raw):
         with pytest.raises(dictate.ConfigError):
@@ -3423,3 +3423,199 @@ class TestRealPystrayMenu:
         assert multi.checked is False
         multi(MagicMock())
         select.assert_called_once_with("Multi")
+
+
+# --- Parakeet engine (#24) ---------------------------------------------------
+
+import wave  # noqa: E402
+
+import parakeet  # noqa: E402
+
+PARAKEET_MODELS = "Fast:parakeet:nemo-parakeet-tdt-0.6b-v3, Small:whisper:small"
+
+
+class FakeParakeet(parakeet.ParakeetModel):
+    """A ParakeetModel that records calls instead of loading ONNX files."""
+
+    def __init__(self, model_id="nemo-parakeet-tdt-0.6b-v3", cpu_threads=0):
+        self.model_id, self.cpu_threads, self.calls = model_id, cpu_threads, []
+
+    def transcribe(self, audio, language=None, **kw):
+        self.calls.append(dict(kw, language=language))
+        seg = SimpleNamespace(text="hello", start=0.0, end=1.0, avg_logprob=-0.1, words=[])
+        return [seg], SimpleNamespace(duration=len(audio) / 16000, language=language)
+
+
+@pytest.fixture
+def fake_parakeet(monkeypatch):
+    """Parakeet builds return FakeParakeet; Whisper builds go to WhisperModel as usual."""
+    built = []
+    monkeypatch.setattr(dictate, "build_model", _recording_build_model(built))
+    return built
+
+
+def _recording_build_model(built):
+    real = dictate.build_model
+
+    def build(engine, model_id, config, cpu_threads=None):
+        if engine == "parakeet":
+            built.append(FakeParakeet(model_id, cpu_threads or 4))
+            return built[-1]
+        return real(engine, model_id, config, cpu_threads)
+    return build
+
+
+def _parakeet_config(config_file, dictation_model="Fast", meeting_model="Fast"):
+    _write_behavior(
+        config_file, models=PARAKEET_MODELS,
+        dictation_model=dictation_model, meeting_model=meeting_model,
+    )
+    return dictate.load_config()
+
+
+class TestParakeetConfig:
+    def test_engine_is_accepted(self):
+        choice = dictate.parse_model_choices("Fast:parakeet:nemo-parakeet-tdt-0.6b-v3")[0]
+
+        assert choice.engine == "parakeet"
+
+    def test_build_model_creates_parakeet_with_threads(self, monkeypatch):
+        made = {}
+        monkeypatch.setattr(
+            dictate.parakeet_mod, "ParakeetModel",
+            lambda model_id, **kw: made.update(model_id=model_id, **kw) or "m",
+        )
+        config = {"parakeet_script_penalty": {"*": None}, "custom_terms": "ML repository, Claude",
+                  "language_allowlist": ["en", "ru"]}
+
+        assert dictate.build_model("parakeet", "x", config, cpu_threads=3) == "m"
+        assert made == {"model_id": "x", "cpu_threads": 3, "script_penalty": {"*": None},
+                        "glossary": ["ML repository", "Claude"], "language_allowlist": ["en", "ru"]}
+
+    def test_script_penalty_defaults(self, mock_config):
+        assert dictate.load_config()["parakeet_script_penalty"] == {
+            "*": None, "ru": 3.0, "uk": 3.0, "bg": 3.0}
+
+    def test_script_penalty_is_read(self, mock_config):
+        mock_config.write_text(mock_config.read_text() + "\n[parakeet]\nscript_penalty = *:2, ru:5\n")
+
+        # Entries override defaults one language at a time: uk and bg keep theirs.
+        assert dictate.load_config()["parakeet_script_penalty"] == {
+            "*": 2.0, "ru": 5.0, "uk": 3.0, "bg": 3.0}
+
+    def test_bad_script_penalty_stops_the_app(self, mock_config):
+        mock_config.write_text(mock_config.read_text() + "\n[parakeet]\nscript_penalty = ru:soft\n")
+
+        with pytest.raises(dictate.ConfigError, match="script_penalty"):
+            dictate.load_config()
+
+    def test_build_model_keeps_whisper_for_whisper(self, created_models):
+        dictate.build_model("whisper", "small", {"device": "cpu", "compute_type": "int8"})
+
+        assert created_models[0][0] == "small"
+
+
+class TestParakeetLanguage(NoBackgroundModelLoad):
+    """Parakeet dictation: Whisper's language rules with the layout always enforced;
+    without a language the model picks the allowlist alphabet itself (#24)."""
+
+    def _dictation(self, mock_config, **config):
+        d = dictate.Dictation(dictate.load_config())
+        d.config.update(config)
+        d.model = FakeParakeet()
+        return d
+
+    def _layout(self, monkeypatch, lang):
+        monkeypatch.setattr(dictate, "detect_current_keyboard_layout", lambda: "x")
+        monkeypatch.setattr(dictate, "detect_current_keyboard_language", lambda m: lang)
+
+    def test_layout_is_used_even_with_enforcement_off(self, mock_config, monkeypatch):
+        self._layout(monkeypatch, "en")
+        d = self._dictation(mock_config, language=None, enforce_language_from_layout=False)
+
+        d._begin_session_language()
+
+        assert d._language_for_audio(np.zeros(10)) == "en"
+
+    def test_fixed_language_wins_over_layout(self, mock_config, monkeypatch):
+        self._layout(monkeypatch, "en")
+        d = self._dictation(mock_config, language="ru")
+
+        d._begin_session_language()
+
+        assert d._language_for_audio(np.zeros(10)) == "ru"
+
+    def test_unmapped_layout_lets_the_model_detect(self, mock_config, monkeypatch):
+        self._layout(monkeypatch, None)
+        d = self._dictation(mock_config, language=None, language_allowlist=["en", "ru"])
+
+        d._begin_session_language()
+
+        assert d._language_for_audio(np.zeros(10)) is None
+
+    def test_layout_outside_the_allowlist_lets_the_model_detect(self, mock_config, monkeypatch):
+        self._layout(monkeypatch, "de")
+        d = self._dictation(mock_config, language=None, language_allowlist=["en", "ru"])
+
+        d._begin_session_language()
+
+        assert d._language_for_audio(np.zeros(10)) is None
+
+    def test_whisper_still_needs_the_enforcement_flag(self, mock_config, monkeypatch):
+        self._layout(monkeypatch, "en")
+        d = self._dictation(mock_config, language=None, enforce_language_from_layout=False)
+        d.model = MockWhisperModel()
+
+        d._begin_session_language()
+
+        assert d._session_enforced_language is None
+
+    def test_file_mode_lets_the_model_detect(self, mock_config, tmp_path):
+        d = self._dictation(mock_config, language=None, language_allowlist=["en", "ru"])
+        wav = tmp_path / "a.wav"
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(np.zeros(1600, np.int16).tobytes())
+
+        d.transcribe_file_to_output(str(wav), str(tmp_path / "out.txt"))
+
+        assert d.model.calls[0]["language"] is None
+
+
+class TestParakeetMeeting:
+    def test_same_parakeet_model_is_shared(self, mock_config, fake_parakeet):
+        d = _loaded(dictate.Dictation(_parakeet_config(mock_config)))
+
+        assert d.meeting_model() is d.model
+        assert len(fake_parakeet) == 1
+
+    def test_different_meeting_model_gets_its_own_instance(self, mock_config, fake_parakeet, created_models):
+        d = _loaded(dictate.Dictation(_parakeet_config(mock_config, dictation_model="Small")))
+
+        meeting_model = d.meeting_model()
+
+        assert isinstance(meeting_model, FakeParakeet)
+        assert meeting_model.cpu_threads == d.config["meeting_cpu_threads"]
+
+    def test_meeting_does_not_read_the_keyboard_layout(self, mock_config, monkeypatch, tmp_path, created_models):
+        # A meeting's language has nothing to do with the layout; runs detect it.
+        monkeypatch.setattr(dictate, "detect_current_keyboard_language",
+                            lambda m: pytest.fail("meeting must not read the layout"))
+        d = _loaded(dictate.Dictation(dictate.load_config()))
+        d._meeting_tmp_root = tmp_path
+        d._meeting_spawn = lambda *a, **k: MagicMock(poll=lambda: None)
+        d.config["meeting_transcript_dir"] = str(tmp_path / "out")
+
+        d.start_meeting()
+        d.stop_meeting(transcribe=False)
+
+    def test_download_uses_onnx_asr(self, mock_config, fake_parakeet, monkeypatch):
+        fetched = []
+        monkeypatch.setattr(dictate.parakeet_mod, "download", fetched.append)
+        d = _loaded(dictate.Dictation(_parakeet_config(mock_config, dictation_model="Small",
+                                                       meeting_model="Small")))
+
+        d.select_meeting_model("Fast")
+        d._model_download_thread.join(2)
+
+        assert fetched == ["nemo-parakeet-tdt-0.6b-v3"]
