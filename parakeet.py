@@ -43,6 +43,13 @@ SAMPLE_RATE = 16000
 # Silence added at both ends before encoding. Without it Parakeet returned nothing
 # for some short utterances that start or end right at the chunk edge.
 EDGE_PAD_S = 0.3
+# Loudness each piece is brought to before encoding (RMS of float audio). Parakeet
+# returns nothing for quiet or distant speech that Whisper still hears: in a phone
+# video, "здоровое и умное" at RMS 0.018 came out empty and appeared once raised.
+# 0.05 recovered the most words there; 0.1 started splitting sentences.
+TARGET_RMS = 0.05
+# Upper limit on that gain, so a piece of near silence is not raised into noise.
+MAX_GAIN = 10.0
 # Glossary bonus added to a token's score (log space). 2.0 fixed "agent session" ->
 # "agentic session" in the spike without inserting terms where none were spoken.
 GLOSSARY_BONUS = 2.0
@@ -392,7 +399,7 @@ class ParakeetModel:
         """Encode at most MAX_PASS_S of audio once; decode it in `language`, or in
         each candidate alphabet when `language` is None. Returns (words, language)."""
         pad = np.zeros(int(EDGE_PAD_S * SAMPLE_RATE), np.float32)
-        padded = np.concatenate([pad, audio, pad])[None, :]
+        padded = np.concatenate([pad, normalize_loudness(audio), pad])[None, :]
         lengths = np.array([padded.shape[1]], np.int64)
         encoder_out, encoder_lens = self._asr._encode(*self._asr._preprocessor(padded, lengths))
         encodings, length = encoder_out[0], int(encoder_lens[0])
@@ -457,6 +464,33 @@ class ParakeetModel:
             (Word(clamp(s), clamp(e), text, float(np.exp(np.mean(lps)))), lps)
             for text, s, e, lps in groups if text
         ]
+
+
+def _scaled(audio: np.ndarray) -> np.ndarray:
+    """Scale audio to TARGET_RMS, by at most MAX_GAIN either way, clipped to [-1, 1]."""
+    rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+    if rms <= 0.0:
+        return audio
+    gain = min(max(TARGET_RMS / rms, 1.0 / MAX_GAIN), MAX_GAIN)
+    return np.clip(audio * gain, -1.0, 1.0)
+
+
+def normalize_loudness(audio: np.ndarray) -> np.ndarray:
+    """Bring each speech run in `audio` to TARGET_RMS on its own.
+
+    One gain for the whole piece is not enough: a phone video mixes a close, loud
+    speaker with quiet ones, and the loud one sets the gain. Pauses between runs keep
+    their level. Without detected runs, the whole piece is scaled."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    audio = np.asarray(audio, dtype=np.float32)
+    runs = get_speech_timestamps(audio, VadOptions(min_silence_duration_ms=500, speech_pad_ms=200))
+    if not runs:
+        return _scaled(audio).astype(np.float32)
+    out = audio.copy()
+    for run in runs:
+        out[run["start"]:run["end"]] = _scaled(audio[run["start"]:run["end"]])
+    return out
 
 
 def detection_score(durations: list[int], logprobs: list[float], frames: float) -> float:

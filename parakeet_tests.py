@@ -219,6 +219,29 @@ class TestLongAudio:
         assert all(end - start <= parakeet.MAX_PASS_S * 16000 for start, end in pieces)
 
 
+class TestLoudness:
+    def test_quiet_piece_is_raised_to_target(self, monkeypatch):
+        monkeypatch.setattr("faster_whisper.vad.get_speech_timestamps", lambda audio, options: [])
+        quiet = np.full(16000, 0.01, np.float32)
+        out = parakeet.normalize_loudness(quiet)
+        assert np.sqrt(np.mean(out ** 2)) == pytest.approx(parakeet.TARGET_RMS, rel=1e-4)
+
+    def test_gain_is_capped(self, monkeypatch):
+        monkeypatch.setattr("faster_whisper.vad.get_speech_timestamps", lambda audio, options: [])
+        hiss = np.full(16000, 0.0001, np.float32)
+        assert parakeet.normalize_loudness(hiss).max() == pytest.approx(0.0001 * parakeet.MAX_GAIN)
+
+    def test_each_speech_run_is_scaled_on_its_own(self, monkeypatch):
+        runs = [{"start": 0, "end": 8000}, {"start": 16000, "end": 24000}]
+        monkeypatch.setattr("faster_whisper.vad.get_speech_timestamps", lambda audio, options: runs)
+        audio = np.zeros(24000, np.float32)
+        audio[:8000], audio[8000:16000], audio[16000:] = 0.2, 0.001, 0.01
+        out = parakeet.normalize_loudness(audio)
+        assert out[0] == pytest.approx(parakeet.TARGET_RMS)  # loud speaker lowered
+        assert out[16000] == pytest.approx(parakeet.TARGET_RMS)  # quiet speaker raised
+        assert out[8000] == pytest.approx(0.001)  # pause keeps its level
+
+
 class TestSpeechGate:
     def test_no_speech_returns_nothing(self, monkeypatch):
         monkeypatch.setattr(parakeet.ParakeetModel, "_has_speech", staticmethod(lambda a, p: False))
