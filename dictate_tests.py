@@ -1753,13 +1753,13 @@ class TestTrayMeetingMenu:
         _, tray = self._tray()
         tray.dictation._meeting_tmp_root = tmp_path
 
-        assert tray._meeting_disk_text() == "Meeting audio: 2 MB (1 file)"
+        assert tray._meeting_disk_text() == "Recordings folder: 2 MB (1 file)"
 
     def test_disk_line_reads_clean_when_there_is_no_scratch_audio(self, tmp_path):
         _, tray = self._tray()
         tray.dictation._meeting_tmp_root = tmp_path
 
-        assert tray._meeting_disk_text() == "Meeting audio: none"
+        assert tray._meeting_disk_text() == "Recordings folder: none"
 
 
 class TestScratchWavPath:
@@ -3007,7 +3007,7 @@ class TestTrayModelMenus:
 
         index = titles.index("Restart hotkey listener")
         audio = items[index + 1]
-        assert audio.title().startswith("Meeting audio:")
+        assert audio.title().startswith("Recordings folder:")
         assert audio.is_enabled() is True
         assert self._titles(audio.action.items) == [
             "Open recorded audio folder", "Delete recorded audio files",

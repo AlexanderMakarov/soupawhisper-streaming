@@ -49,7 +49,7 @@ def _import_keyboard():
 
     return keyboard
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # Logger will be configured in main()
 logger = logging.getLogger(__name__)

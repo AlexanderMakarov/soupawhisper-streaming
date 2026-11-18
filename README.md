@@ -205,7 +205,7 @@ Meeting mode and dictation are **mutually exclusive**: while a meeting records, 
 
 ### Using it
 
-Start and stop from the tray menu (**Start meeting recording**), or set `hotkey = shift+f12` under `[meeting]`. The tray icon switches to a two-people glyph for the whole call, and the **Meeting audio** submenu shows how much scratch audio is on disk, with **Delete recorded audio files** and **Open recorded audio folder** actions.
+Start and stop from the tray menu (**Start meeting recording**), or set `hotkey = shift+f12` under `[meeting]`. The tray icon switches to a two-people glyph for the whole call, and the **Recordings folder** submenu shows how much scratch audio is on disk, with **Open recorded audio folder** and **Delete recorded audio files** actions.
 
 Nothing is transcribed while recording — two `pw-record` processes write WAV straight to disk at near-zero CPU, so nothing competes with the video call. Transcription runs once, after you stop.
 
