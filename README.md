@@ -4,7 +4,7 @@ Built-in speech-to-text (macOS dictation / F6, Windows voice typing) and typical
 
 **SoupaWhisper Streaming** is for that gap. It is local voice dictation for **Linux** and **macOS** where you **speak and type in the same breath**: dictate the boilerplate, type the precise bit yourself, keep talking. Technical workers (IT, medical, legal, and anyone living in forms, tickets, and docs) get the speed of speech without giving up control over the tokens that must be exact.
 
-On-device [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — no cloud, no API keys. Optional NVIDIA GPU. A tray / menu-bar icon shows when the mic is live and which language the session is using.
+On-device speech recognition with two engines: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and NVIDIA [Parakeet TDT 0.6B v3](#parakeet-engine) — no cloud, no API keys. Optional NVIDIA GPU. A tray / menu-bar icon shows when the mic is live and which language the session is using.
 
 ### How you use it (streaming)
 
@@ -23,8 +23,10 @@ Typical typing is ~40 WPM for most people and ~75 WPM for professionals ([ref](h
 
 - **Speak + type in parallel** — the main advantage over OS dictation and one-shot tools: insert speech in chunks while the keyboard stays yours.
 - **Always-visible status** — tray / menu-bar icon for idle, loading, recording, transcribing, error, plus an `EN` / `RU` / `AUTO` language chip; Start/Stop and Quit from the menu.
-- **Two languages that follow the keyboard** — with `language=auto`, allowlists and `enforce_language_from_layout` lock Whisper to the layout at hotkey press for the whole session.
+- **Two languages that follow the keyboard** — with `language=auto`, allowlists and `enforce_language_from_layout` lock the model to the layout at hotkey press for the whole session.
 - **Domain vocabulary** — `custom_terms` bias the decoder while it runs (`hotwords` + `initial_prompt`), not a post-hoc find-and-replace.
+- **Two engines, switched from the tray** — Whisper for the widest language coverage, Parakeet for ~2.7× faster dictation on CPU (25 European languages); pick one for dictation and another for meetings.
+- **Meeting transcripts** — record a call as two tracks (you and everyone else) and get a speaker-labelled Markdown transcript, on Linux.
 - **Background-friendly** — user service (systemd / launchd), one hotkey, config file; built for ordinary laptops.
 
 ---
@@ -37,6 +39,8 @@ Typical typing is ~40 WPM for most people and ~75 WPM for professionals ([ref](h
 | Status UI | Tray / menu-bar: mic state, language chip, Start/Stop menu | Often none, or only a brief notification |
 | Two-language dictation | Allowlist + active keyboard layout at hotkey press | One global language, or auto-detect that drifts on short chunks |
 | Custom terms | Bias during transcription | Usually replace after the fact |
+| Engines | Whisper and Parakeet, switched from the tray | One built-in model |
+| Meetings | Two-track recording, speaker-labelled transcript | Separate app or cloud service |
 | Control | Tray + config + CLI + user service | Full GUI, or no tray |
 
 Engines: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (default) and NVIDIA [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) through [onnx-asr](https://github.com/istupakov/onnx-asr) — see [Parakeet engine](#parakeet-engine). Not yet: a model manager.
@@ -217,7 +221,7 @@ Audio is deleted **only after** the transcript lands. If transcription fails, th
 
 ### Speed
 
-Meeting transcription uses its **own** Whisper model instance, so dictation is usable the moment recording stops rather than queueing behind it. `cpu_threads` (default: half the logical cores) caps it. A Parakeet meeting model that is the same as the dictation model shares that instance instead; both still run at once.
+Meeting transcription uses its **own** model instance, so dictation is usable the moment recording stops rather than queueing behind it. `cpu_threads` (default: half the logical cores) caps it. A Parakeet meeting model that is the same as the dictation model shares that instance instead; both still run at once.
 
 Measured on an i5-10300H (4 physical cores + HT), 57s of silence-heavy audio:
 
@@ -352,6 +356,8 @@ English-only `*.en` models are slightly better for English-only work. Multilingu
 
 For English streaming, `base.en` or `small.en` is usually enough. For Russian / bilingual / `auto`, use `base`+ without `.en`. Larger models are much slower; mic quality often matters more.
 
+Parakeet TDT 0.6B v3 (~640 MB int8, 25 European languages) is faster than Whisper `base` on CPU with similar or better accuracy — see [Parakeet engine](#parakeet-engine).
+
 ---
 
 # TODO/Roadmap
@@ -361,6 +367,8 @@ For English streaming, `base.en` or `small.en` is usually enough. For Russian / 
 - [x] Multiple languages support.
 - [x] Support list of custom terms or pronunciation features (like accents or speech patterns).
 - [x] Status icon in the menu bar / system tray, so it is always visible when the microphone is live.
-- [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
+- [x] Reuse previous transcription as context (`context_words`).
+- [x] Meeting recording with speaker-labelled transcripts.
+- [x] Second engine: NVIDIA Parakeet TDT 0.6B v3, switchable from the tray.
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
 - [ ] Expose more `model.transcribe()` options in config.
