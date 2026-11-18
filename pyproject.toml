@@ -1,6 +1,6 @@
 [project]
 name = "soupawhisper-streaming"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local voice dictation for Linux and macOS — streaming insert, tray status, layout-aware multilingual Whisper and Parakeet"
 authors = [
     {name = "Aleksandr Makarov", email = "4ellendger@gmail.com"}

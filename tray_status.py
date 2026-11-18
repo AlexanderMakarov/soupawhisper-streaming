@@ -680,9 +680,9 @@ class TrayStatus:
 
         usage = meeting.wav_usage(self._meeting_tmp_root())
         if usage.count == 0:
-            return "Meeting audio: none"
+            return "Recordings folder: none"
         plural = "" if usage.count == 1 else "s"
-        return f"Meeting audio: {usage.human} ({usage.count} file{plural})"
+        return f"Recordings folder: {usage.human} ({usage.count} file{plural})"
 
     def _on_toggle_meeting(self, icon, item) -> None:
         try:
@@ -698,9 +698,9 @@ class TrayStatus:
         keep = recorder.session_dir if getattr(self.dictation, "meeting_active", False) and recorder else None
         try:
             freed = meeting.purge_wavs(self._meeting_tmp_root(), keep=keep)
-            logger.info("Deleted meeting audio, freed %.0f MB", freed / 1e6)
+            logger.info("Deleted recorded audio files, freed %.0f MB", freed / 1e6)
         except Exception as e:
-            logger.error("Could not delete meeting audio: %s", e, exc_info=True)
+            logger.error("Could not delete recorded audio files: %s", e, exc_info=True)
         # The size is too costly to poll, so ask for a rebuild to show the new one.
         self._last_menu_signature = None
 
