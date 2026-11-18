@@ -498,8 +498,9 @@ class TrayStatus:
             MenuItem(
                 lambda item: self._meeting_disk_text(),
                 Menu(
-                    MenuItem("Delete recorded audio files", self._on_purge_meeting_audio),
+                    # Open first: the harmless item sits where the pointer lands.
                     MenuItem("Open recorded audio folder", self._on_open_meeting_audio),
+                    MenuItem("Delete recorded audio files", self._on_purge_meeting_audio),
                 ),
             ),
             MenuItem("Open log", self._on_open_log),

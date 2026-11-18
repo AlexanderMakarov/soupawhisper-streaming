@@ -10,6 +10,7 @@ import pytest
 
 pytestmark = pytest.mark.timeout(2)
 
+import logging
 import sys
 import os
 
@@ -1303,3 +1304,47 @@ class TestLanguageContextBounds:
         audio = np.arange(600, dtype=np.float32)
         runs = [(0, 300), (300, 600)]
         np.testing.assert_array_equal(meeting._language_context(audio, runs, 0, 10), audio[:300])
+
+
+class NoDetectorModel:
+    """Like ParakeetModel: transcribe() only, reporting the language it picked."""
+
+    def __init__(self, picked="ru"):
+        self.calls = []
+        self.picked = picked
+
+    def transcribe(self, audio, **kw):
+        self.calls.append(kw.get("language"))
+        info = SimpleNamespace(duration=len(audio) / 16000, language=self.picked)
+        return [FakeSegment(0.0, 1.0, "text")], info
+
+
+class TestMeetingLanguageWithoutDetector:
+    """Parakeet picks each run's alphabet itself, so it is asked with language=None."""
+
+    def audio(self):
+        return np.zeros(20 * 16000, dtype=np.float32)
+
+    def test_every_run_lets_the_model_pick(self):
+        model = NoDetectorModel()
+
+        meeting.transcribe_runs(
+            model, self.audio(), allowlist=["en", "ru"],
+            find_runs=runs_at((1.0, 3.0), (8.0, 9.0), (15.0, 18.0)),
+        )
+
+        assert model.calls == [None, None, None]
+
+    def test_the_picked_language_is_logged_per_run(self, caplog):
+        with caplog.at_level(logging.INFO, logger=meeting.logger.name):
+            meeting.transcribe_runs(NoDetectorModel("en"), self.audio(), find_runs=runs_at((1.0, 3.0)))
+
+        assert "run 1/1 at 1.0s (2.0s) -> en" in caplog.text
+
+    def test_whisper_keeps_per_run_detection(self):
+        model = WindowModel()
+
+        meeting.transcribe_runs(model, self.audio(), find_runs=runs_at((1.0, 3.0)))
+
+        # WindowModel's detector says "en".
+        assert model.calls == ["en"]

@@ -30,6 +30,7 @@ import pyaudio
 import webrtcvad
 
 import meeting as meeting_mod
+import parakeet as parakeet_mod
 
 from faster_whisper import WhisperModel, download_model
 try:
@@ -75,7 +76,7 @@ FATAL_NOTIFICATION_TIMEOUT_MS = 15000
 MODEL_LOADING_MESSAGE = (
     "Model is still loading. Wait a little and try again; see the tray menu or log for status."
 )
-SUPPORTED_MODEL_ENGINES = ("whisper",)
+SUPPORTED_MODEL_ENGINES = ("whisper", "parakeet")
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,30 @@ class ModelChoice:
     label: str
     engine: str
     model: str
+
+
+def build_model(engine: str, model_id: str, config: dict, cpu_threads: Optional[int] = None):
+    """Create the model for an engine; both expose WhisperModel's transcribe()."""
+    if engine == "parakeet":
+        # Default to half the logical cores: on 4 cores / 8 threads, 4 beat 2 and 8.
+        threads = cpu_threads or max(1, (os.cpu_count() or 2) // 2)
+        return parakeet_mod.ParakeetModel(
+            model_id, cpu_threads=threads,
+            script_penalty=config.get("parakeet_script_penalty"),
+            glossary=_parse_custom_terms(config.get("custom_terms") or ""),
+            language_allowlist=config.get("language_allowlist"),
+        )
+    kwargs = {"cpu_threads": cpu_threads} if cpu_threads else {}
+    return WhisperModel(
+        model_id, device=config["device"], compute_type=config["compute_type"], **kwargs
+    )
+
+
+def uses_layout_language(model) -> bool:
+    """Parakeet dictation always follows the keyboard layout, as if
+    enforce_language_from_layout were on: its language detection only tells
+    alphabets apart, and the layout is a stronger hint for the field being typed in."""
+    return isinstance(model, parakeet_mod.ParakeetModel)
 
 
 @dataclass(frozen=True)
@@ -614,6 +639,15 @@ def load_config():
         raise ValueError("[streaming] context_reset_seconds must be finite and non-negative")
 
     model_choices, dictation_label, meeting_label = _read_model_selection(config)
+    penalty_raw = config.get("parakeet", "script_penalty", fallback="").strip()
+    try:
+        # Entries override the defaults one language at a time, so "ru:5" keeps uk and bg.
+        script_penalty = {
+            **parakeet_mod.DEFAULT_SCRIPT_PENALTY,
+            **(parakeet_mod.parse_script_penalty(penalty_raw) if penalty_raw else {}),
+        }
+    except ValueError as e:
+        raise ConfigError(f"[parakeet] script_penalty: {e}") from None
     startup_model = next(
         (choice.model for choice in model_choices if choice.label == dictation_label),
         config.get("whisper", "model", fallback="base"),
@@ -624,6 +658,8 @@ def load_config():
         "model": startup_model,
         # Models offered in the tray. Empty means the tray has no model menus.
         "model_choices": model_choices,
+        # Parakeet: per-language alphabet mask strength (None = ban other alphabets).
+        "parakeet_script_penalty": script_penalty,
         "dictation_model": dictation_label,
         "meeting_model": meeting_label,
         "device": config.get("whisper", "device", fallback="cpu"),
@@ -1052,7 +1088,7 @@ class Dictation:
             )
 
         # Load model in background.
-        logger.debug(f"Loading Whisper model ({config['model']})...")
+        logger.debug(f"Loading model ({config['model']})...")
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def get_hotkey_name(self) -> str:
@@ -1063,15 +1099,19 @@ class Dictation:
     def _choice_model_id(self, label: Optional[str]) -> Optional[str]:
         return next((c.model for c in self.model_choices if c.label == label), None)
 
+    def _choice_engine(self, label: Optional[str]) -> str:
+        return next((c.engine for c in self.model_choices if c.label == label), "whisper")
+
     def _load_model(self):
         model_id = self._choice_model_id(self.dictation_label) or self.config["model"]
         try:
             if self._model_switch_in_progress:
                 release_freed_memory()
-            self.model = WhisperModel(model_id, device=self.config["device"], compute_type=self.config["compute_type"])
+            engine = self._choice_engine(self.dictation_label)
+            self.model = build_model(engine, model_id, self.config)
             self._model_switch_in_progress = False
             self.model_loaded.set()
-            logger.info(f"Model {model_id} ({self.config['device']}, {self.config['compute_type']}) loaded.")
+            logger.info(f"Model {model_id} ({engine}, {self.config['device']}, {self.config['compute_type']}) loaded.")
             self._finish_model_loading()
         except Exception as e:
             self.model_error = str(e)
@@ -1145,7 +1185,9 @@ class Dictation:
     def _download_meeting_model(self, label: str) -> None:
         model_id = self._choice_model_id(label)
         try:
-            if not os.path.isdir(model_id):
+            if self._choice_engine(label) == "parakeet":
+                parakeet_mod.download(model_id)
+            elif not os.path.isdir(model_id):
                 download_model(model_id)
         except Exception as e:
             logger.error("[model] Download of %s failed", model_id, exc_info=True)
@@ -1367,6 +1409,8 @@ class Dictation:
         Captured once in start_recording (hotkey press) and cleared when the session ends,
         so idle tray shows AUTO again and the next hotkey re-reads the current layout.
         """
+        if uses_layout_language(self.model):
+            return self._session_enforced_language
         if not self.config.get("enforce_language_from_layout", False):
             return None
         return self._session_enforced_language
@@ -1385,10 +1429,11 @@ class Dictation:
         Does not re-check during a running session (determinism + fewer layout queries).
         """
         self._session_enforced_language = None
-        if not self.config.get("enforce_language_from_layout", False):
+        if not (self.config.get("enforce_language_from_layout", False)
+                or uses_layout_language(self.model)):
             return
         if self.config.get("language") is not None:
-            # Fixed whisper language: don't override.
+            # Fixed language: don't override.
             return
         layout_id = detect_current_keyboard_layout()
         mapped = self._layout_to_language_map.get(layout_id) if layout_id else None
@@ -1489,6 +1534,16 @@ class Dictation:
     def _language_for_audio(self, audio: np.ndarray) -> Optional[str]:
         """Pick the decode language: layout override, else configured or detected."""
         enforced = self._maybe_enforced_language_for_field()
+        if uses_layout_language(self.model):
+            # Whisper's rules, but nothing to ask detect_language: None makes the
+            # model pick among the allowlist's alphabets itself.
+            configured_lang = self.config.get("language")
+            allowlist = self.config.get("language_allowlist")
+            if configured_lang is not None:
+                return configured_lang
+            if enforced and (not allowlist or enforced in allowlist):
+                return enforced
+            return None
         configured_lang = self.config.get("language")
         allowlist = self.config.get("language_allowlist")
         # Only override in auto mode. If allowlist exists, enforce only if it is allowed.
@@ -1509,16 +1564,22 @@ class Dictation:
         """
         if self._meeting_model is None:
             threads = self.config["meeting_cpu_threads"]
+            engine = self._choice_engine(self.meeting_label)
             model_id = self._choice_model_id(self.meeting_label) or self.config["model"]
-            logger.info("[meeting] Loading model %s (%d threads)", model_id, threads)
+            same_as_dictation = (
+                engine == self._choice_engine(self.dictation_label)
+                and model_id == (self._choice_model_id(self.dictation_label) or self.config["model"])
+            )
+            if engine == "parakeet" and same_as_dictation and self.model is not None:
+                # Unlike CTranslate2, an ONNX session runs concurrent calls, so a
+                # meeting and dictation can share it (and ~1.8 GB of memory).
+                logger.info("[meeting] Sharing the dictation model %s", model_id)
+                self._meeting_model = self.model
+                return self._meeting_model
+            logger.info("[meeting] Loading model %s (%s, %d threads)", model_id, engine, threads)
             # May include a first-time download, so say why progress hasn't started.
             self.meeting_progress = meeting_mod.PROGRESS_LOADING_MODEL
-            self._meeting_model = WhisperModel(
-                model_id,
-                device=self.config["device"],
-                compute_type=self.config["compute_type"],
-                cpu_threads=threads,
-            )
+            self._meeting_model = build_model(engine, model_id, self.config, cpu_threads=threads)
         return self._meeting_model
 
     def start_meeting(self) -> None:
@@ -2028,8 +2089,11 @@ class Dictation:
         audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
         if self.model_error or self.model is None:
             raise RuntimeError("Model not loaded")
-        lang = resolve_transcription_language(
-            self.model, audio_array, self.config.get("language"), self.config.get("language_allowlist")
+        lang = (
+            self._language_for_audio(audio_array) if uses_layout_language(self.model)
+            else resolve_transcription_language(
+                self.model, audio_array, self.config.get("language"), self.config.get("language_allowlist")
+            )
         )
         # No VAD filter: for pre-recorded files nothing should be dropped,
         # and subtitle timestamps must stay aligned with the original audio.
@@ -2375,7 +2439,7 @@ class StreamingDictation(Dictation):
                 lang = self._language_for_audio(segment)
                 # With unrestricted auto detection, resolve the new chunk's language
                 # before supplying history so a switch cannot inherit the old prompt.
-                if recent_text and lang is None:
+                if recent_text and lang is None and hasattr(self.model, "detect_language"):
                     try:
                         lang, _, _ = self.model.detect_language(
                             segment, vad_filter=True,

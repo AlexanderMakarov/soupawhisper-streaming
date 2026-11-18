@@ -39,7 +39,7 @@ Typical typing is ~40 WPM for most people and ~75 WPM for professionals ([ref](h
 | Custom terms | Bias during transcription | Usually replace after the fact |
 | Control | Tray + config + CLI + user service | Full GUI, or no tray |
 
-Not yet: a model manager, or backends other than faster-whisper.
+Engines: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (default) and NVIDIA [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) through [onnx-asr](https://github.com/istupakov/onnx-asr) — see [Parakeet engine](#parakeet-engine). Not yet: a model manager.
 
 ---
 
@@ -127,7 +127,7 @@ layout_to_language = us:en, ru:ru, com.apple.keylayout.US:en, com.apple.keylayou
 
 Layout language is captured **once at hotkey press** for the session. On Linux, active layout uses `xkb-switch` / `xkblayout-state` if present, else X11 `XkbGetState` + `setxkbmap`. Built-in mappings also cover configs without that line: `us`/`gb` → `en`, `ua` → `uk`, XKB country ids that are a different Whisper language (`br` → `pt`, `si` → `sl`; `be`, `ca` are detected) and the macOS US, ABC, British, Russian and Ukrainian layouts. Your `layout_to_language` entries override them. Other layouts are used only when the layout id is a language Whisper knows (e.g. `ru`, `de`); otherwise the language is detected. Allowlist detection still runs Whisper’s normal language scores and **filters** them — not a second full decode; one language in config/allowlist skips detect entirely.
 
-**Custom terms** — `custom_terms = Claude, Kubernetes, GraphQL` (comma or newlines; hint to the decoder, not a guarantee).
+**Custom terms** — `custom_terms = Claude, Kubernetes, GraphQL` (comma or newlines; hint to the decoder, not a guarantee). Fully effective with Whisper models only; Parakeet gets a weaker per-token nudge.
 
 **Streaming noise rejects** — `reject_phrases = thank you, thanks, okay` skips a chunk only when the whole chunk equals a phrase (punctuation ignored).
 
@@ -148,6 +148,30 @@ meeting_model = Multi-language
 [config.example.ini](/config.example.ini) explains the format and rules in its "Model switching" comments.
 
 An invalid `models` setting or a failed model load stops the app with a notification. After fixing it, run `make service-start`. Existing systemd installs need `make service-reinstall` once, so that the service doesn't restart in a loop.
+
+### Parakeet engine
+
+[Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) is a CPU-friendly alternative to Whisper for 25 European languages, including English, Russian and Ukrainian. It's free (CC-BY-4.0), local, and downloads anonymously (~640 MB int8). Add it to `models`:
+
+```ini
+[behavior]
+models = Parakeet:parakeet:nemo-parakeet-tdt-0.6b-v3, Whisper small:whisper:small
+dictation_model = Parakeet
+meeting_model = Parakeet
+```
+
+Measured on an i5-10300H, 4 threads: a dictation chunk took 0.64 s (median) vs 1.73 s for Whisper `base`; a 75-minute two-track meeting took 8.4 min vs 33 min. Accuracy on English and Russian was on par with Whisper `base` or better.
+
+How it differs from Whisper:
+
+- **A language only fixes the alphabet.** Parakeet takes no language: it hears it and writes the words itself, but often puts accented English in Cyrillic letters. So the app restricts the alphabet. `[parakeet] script_penalty` sets how strictly; by default English and other Latin languages forbid other alphabets, while Russian, Ukrainian and Bulgarian let English terms stay in Latin.
+- **Dictation follows the keyboard layout**, as if `enforce_language_from_layout` were always on. A fixed `[whisper] language` still wins.
+- **Meetings and files detect the alphabet from the audio,** per speech run, among the alphabets of `language_allowlist`: each run is decoded once per alphabet and the most confident decode that covers the speech wins. Set `language_allowlist = en, ru` for mixed-language meetings. Languages sharing an alphabet (`en, de`) can't be told apart, which doesn't matter for the text. Without an allowlist the alphabet is not restricted. Long files are split at pauses into pieces of up to 30 s.
+- **Quiet voices are raised.** Parakeet stays silent on quiet or distant speech that Whisper still hears, so each speech run is brought to one loudness (up to 10× gain) before decoding. Overlapping or far-off voices, as in phone videos, are still transcribed better by Whisper `small`.
+- **No text context and only a weak glossary.** `[streaming] context_words` has no effect, and `custom_terms` only nudges the decoder.
+- **Hesitations removed.** Parakeet writes "uh", "um", "э"; they are dropped. Words that are fillers in one language only ("er", "um" in English; German "er" = he) are dropped only when that language is known.
+- **Memory:** ~1.1–1.8 GB. When dictation and meetings use the same Parakeet model, they share one instance.
+- `meeting.min_avg_logprob` is calibrated for Whisper; Parakeet's confidence is on another scale and the default never drops its output.
 
 ### Modes (behavior)
 
@@ -193,7 +217,7 @@ Audio is deleted **only after** the transcript lands. If transcription fails, th
 
 ### Speed
 
-Meeting transcription uses its **own** model instance, so dictation is usable the moment recording stops rather than queueing behind it. `cpu_threads` (default: half the logical cores) caps it.
+Meeting transcription uses its **own** Whisper model instance, so dictation is usable the moment recording stops rather than queueing behind it. `cpu_threads` (default: half the logical cores) caps it. A Parakeet meeting model that is the same as the dictation model shares that instance instead; both still run at once.
 
 Measured on an i5-10300H (4 physical cores + HT), 57s of silence-heavy audio:
 
