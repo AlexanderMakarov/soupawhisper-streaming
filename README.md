@@ -17,7 +17,7 @@ Also available: **push-to-talk** (hold to record, release to insert the full utt
 
 Typical typing is ~40 WPM for most people and ~75 WPM for professionals ([ref](https://www.medrxiv.org/content/10.1101/2025.05.11.25327386v1.full)); this flow often reaches ~150 WPM on the prose while you still type the irreplaceable tokens by hand.
 
-[![Watch the demo](https://img.youtube.com/vi/fRiqNzupudI/0.jpg)](https://youtu.be/fRiqNzupudI)
+[![Watch the demo](https://img.youtube.com/vi/CBBkJNV_kq4/0.jpg)](https://youtu.be/CBBkJNV_kq4)
 
 ### Why you should try it
 
