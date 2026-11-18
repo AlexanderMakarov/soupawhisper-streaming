@@ -3010,7 +3010,7 @@ class TestTrayModelMenus:
         assert audio.title().startswith("Meeting audio:")
         assert audio.is_enabled() is True
         assert self._titles(audio.action.items) == [
-            "Delete recorded audio files", "Open recorded audio folder",
+            "Open recorded audio folder", "Delete recorded audio files",
         ]
 
     def test_audio_actions_left_the_top_level(self):
